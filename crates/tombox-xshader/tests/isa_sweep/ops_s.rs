@@ -193,7 +193,7 @@ fn sop2_ops(s: &mut Suite) {
             vec![Some(r as u32), Some((r >> 32) as u32), Some(nz(r))]
         });
     }
-    s.add("s_bfm_b64", "SOP2", "s,s", Class::Small, &scc_from(17), &[sop2(0x25, D, 10, 11)], &post64(), &[Cmp::X, Cmp::X, Cmp::X], |x| {
+    s.add("s_bfm_b64", "SOP2", "s,s", Class::U64, &scc_from(17), &[sop2(0x25, D, 10, 11)], &post64(), &[Cmp::X, Cmp::X, Cmp::X], |x| {
         let r = (((1u128 << (x.d[0] & 63)) - 1) as u64) << (x.d[1] & 63);
         vec![Some(r as u32), Some((r >> 32) as u32), Some(scc_in(x))]
     });
