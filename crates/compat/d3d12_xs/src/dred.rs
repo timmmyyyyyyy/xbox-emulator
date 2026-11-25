@@ -211,8 +211,8 @@ pub(crate) fn enable_now(m: Mode) -> bool {
     }
     let what = match m {
         Mode::Markers => "auto-breadcrumbs, breadcrumb contexts (PSO markers) and page-fault reporting",
-        Mode::Full => "auto-breadcrumbs and page-fault reporting (TOMBOX_DRED=2 adds PSO markers)",
-        _ => "page-fault reporting (TOMBOX_DRED=1 adds auto-breadcrumbs, 2 PSO markers, 0 disables)",
+        Mode::Full => "auto-breadcrumbs and page-fault reporting (TOMBOX_DRED=2 adds PSO and Dispatch group-count markers)",
+        _ => "page-fault reporting (TOMBOX_DRED=1 adds auto-breadcrumbs, 2 PSO and Dispatch markers, 0 disables)",
     };
     record(M, "dred", &format!("DRED {what} FORCED_ON via {via} (before device creation)"));
     true

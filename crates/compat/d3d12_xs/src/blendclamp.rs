@@ -212,7 +212,7 @@ pub fn passes() -> u64 {
 fn small_float(fmt: u32) -> Option<bool> {
     match fmt {
         26 => Some(false),
-        2 | 10 | 34 | 54 => Some(true),
+        10 | 34 | 54 => Some(true),
         _ => None,
     }
 }

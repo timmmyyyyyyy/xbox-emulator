@@ -137,3 +137,79 @@ fn peek_keeps_bytes_and_cancel_completes_pending() {
         CloseHandle(ev);
     }
 }
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn DuplicateHandle(from: HANDLE, handle: HANDLE, to: HANDLE, duplicate: *mut HANDLE, access: u32, inherit: i32, options: u32) -> i32;
+    fn GetQueuedCompletionStatus(port: HANDLE, bytes: *mut u32, key: *mut usize, ov: *mut *mut OVERLAPPED, timeout: u32) -> i32;
+}
+
+unsafe fn next_packet(port: HANDLE, expected: *mut OVERLAPPED, bytes: u32, error: u32) {
+    let mut count = u32::MAX;
+    let mut key = 0;
+    let mut ov = null_mut();
+    let ok = GetQueuedCompletionStatus(port, &mut count, &mut key, &mut ov, 1000);
+    assert_eq!(if ok == 0 { GetLastError() } else { 0 }, error);
+    assert_eq!((ov, key, count), (expected, 0xfeed, bytes));
+}
+
+#[test]
+fn completion_port_delivers_link_io_and_cancelled_reads() {
+    unsafe {
+        let (l, _) = listener(0x1084);
+        let peer = std::thread::spawn(|| {
+            let c = XbtpLinkCreateHandle();
+            let addr = sockaddr(0x1084);
+            assert_eq!(XbtpLinkConnect(c, addr.as_ptr(), 16, 5000), S_OK);
+            P(c)
+        });
+        let mut h = null_mut();
+        assert_eq!(XbtpLinkAccept(l, &mut h, 5000), S_OK);
+        let c = peer.join().unwrap();
+        let port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, null_mut(), 0, 1);
+        let event = CreateEventW(null_mut(), 1, 0, null());
+        assert!(!event.is_null() && !port.is_null());
+        assert_eq!(XbtpLinkSetCompletionPort(h, event, 0, 1), hr_from_win32(6));
+        let current = GetCurrentProcess();
+        let mut restricted = null_mut();
+        assert_ne!(DuplicateHandle(current, port, current, &mut restricted, 1, 0, 0), 0);
+        assert_eq!(XbtpLinkSetCompletionPort(h, restricted, 0xfeed, 1), hr_from_win32(5));
+        CloseHandle(restricted);
+        assert_ne!(DuplicateHandle(current, port, current, &mut restricted, 2, 0, 0), 0);
+        assert_eq!(XbtpLinkSetCompletionPort(h, restricted, 0xfeed, 1), S_OK);
+        CloseHandle(restricted);
+        assert_eq!(XbtpLinkSetCompletionPort(h, port, 99, 1), E_INVALIDARG);
+
+        let mut data = [0u8; 8];
+        let mut read = OVERLAPPED::default();
+        let mut count = 0;
+        assert_eq!(XbtpLinkRecv(h, data.as_mut_ptr(), 8, &mut count, 0, &mut read), E_PENDING);
+        let mut bytes = *b"pix";
+        let send = WSABUF { len: 3, buf: bytes.as_mut_ptr() };
+        assert_eq!(XbtpLinkSend(c.0, &send, 1, &mut count, 0, null_mut()), S_OK);
+        next_packet(port, &mut read, 3, 0);
+        assert_eq!(&data[..3], b"pix");
+
+        let mut write = OVERLAPPED::default();
+        assert_eq!(XbtpLinkSend(h, &send, 1, &mut count, 0, &mut write), S_OK);
+        next_packet(port, &mut write, MSG_SIZE as u32 + 3, 0);
+        let mut suppressed = OVERLAPPED { event: (event as usize | 1) as HANDLE, ..OVERLAPPED::default() };
+        assert_eq!(XbtpLinkSend(h, &send, 1, &mut count, 0, &mut suppressed), S_OK);
+        assert_eq!(WaitForSingleObject(event, 0), 0);
+        assert_eq!(XbtpLinkRecv(h, data.as_mut_ptr(), 8, &mut count, 0, &mut read), E_PENDING);
+        let device = *(h as *const HANDLE);
+        assert_ne!((link_dev::DEVICE.cancel_io_ex)(device, &mut read), 0);
+        next_packet(port, &mut read, 0, 995);
+        assert_eq!(XbtpLinkRecv(h, data.as_mut_ptr(), 8, &mut count, 0, &mut read), E_PENDING);
+        XbtpLinkCloseHandle(h);
+        next_packet(port, &mut read, 0, 0);
+        let mut key = 0;
+        let mut packet = null_mut();
+        assert_eq!(GetQueuedCompletionStatus(port, &mut count, &mut key, &mut packet, 0), 0);
+        assert!(packet.is_null());
+        CloseHandle(event);
+        CloseHandle(port);
+        XbtpLinkCloseHandle(c.0);
+        XbtpLinkCloseHandle(l);
+    }
+}

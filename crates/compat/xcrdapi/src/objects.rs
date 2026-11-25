@@ -131,7 +131,7 @@ pub struct FactoryVtbl {
     pub set_debug_flags: unsafe extern "system" fn(*mut c_void, u32),
     pub set_staging_buffer_size: unsafe extern "system" fn(*mut c_void, u32) -> i32,
     pub slot9: unsafe extern "system" fn(*mut c_void) -> i32,
-    pub slot10: unsafe extern "system" fn(*mut c_void) -> i32,
+    pub create_queue1: unsafe extern "system" fn(*mut c_void, *const u8, *const c_void, *mut *mut c_void) -> i32,
     pub slot11: unsafe extern "system" fn(*mut c_void) -> i32,
     pub slot12: unsafe extern "system" fn(*mut c_void) -> i32,
     pub slot13: unsafe extern "system" fn(*mut c_void) -> i32,
@@ -145,7 +145,6 @@ pub struct FactoryObj {
 }
 
 trap!(factory_slot9, "IDStorageFactoryX", 9);
-trap!(factory_slot10, "IDStorageFactoryX", 10);
 trap!(factory_slot11, "IDStorageFactoryX", 11);
 trap!(factory_slot12, "IDStorageFactoryX", 12);
 trap!(factory_slot13, "IDStorageFactoryX", 13);
@@ -163,7 +162,7 @@ pub static FACTORY_VTBL: FactoryVtbl = FactoryVtbl {
     set_debug_flags: factory_set_debug_flags,
     set_staging_buffer_size: factory_set_staging_buffer_size,
     slot9: factory_slot9,
-    slot10: factory_slot10,
+    create_queue1: factory_create_queue1,
     slot11: factory_slot11,
     slot12: factory_slot12,
     slot13: factory_slot13,
@@ -201,13 +200,13 @@ unsafe extern "system" fn factory_add_ref(_this: *mut c_void) -> u32 {
     1
 }
 
-unsafe extern "system" fn factory_create_queue(_this: *mut c_void, desc: *const u8, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
+unsafe fn create_queue_from(who: &str, desc: *const u8, extra: Option<u64>, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
     if ppv.is_null() {
         return E_POINTER;
     }
     unsafe { *ppv = core::ptr::null_mut() };
     if desc.is_null() {
-        report("IDStorageFactoryX::CreateQueue", E_INVALIDARG, "null desc");
+        report(who, E_INVALIDARG, "null desc");
         return E_INVALIDARG;
     }
     let mut raw = [0u8; XQUEUE_DESC_SIZE];
@@ -215,18 +214,25 @@ unsafe extern "system" fn factory_create_queue(_this: *mut c_void, desc: *const 
     let q = match QueueInner::create(raw) {
         Ok(q) => q,
         Err((hr, why)) => {
-            report("IDStorageFactoryX::CreateQueue", hr, &why);
+            report(who, hr, &why);
             return hr;
         }
     };
     let obj = Box::into_raw(Box::new(QueueObj { vtbl: &QUEUE_VTBL, refs: AtomicU32::new(1), inner: q.clone() }));
     let hr = unsafe { queue_qi(obj as *mut c_void, riid, ppv) };
     unsafe { queue_release(obj as *mut c_void) };
-    log(
-        "IDStorageFactoryX::CreateQueue",
-        &format!("type={} capacity={} priority={} name='{}' -> hr={hr:#010x} queue={:p}", q.source_type, q.capacity, q.priority, q.name, unsafe { *ppv }),
-    );
+    let tail = extra.map(|v| format!(" desc+0x18={v:#x} (not modelled)")).unwrap_or_default();
+    log(who, &format!("type={} capacity={} priority={} name='{}'{tail} -> hr={hr:#010x} queue={:p}", q.source_type, q.capacity, q.priority, q.name, unsafe { *ppv }));
     hr
+}
+
+unsafe extern "system" fn factory_create_queue(_this: *mut c_void, desc: *const u8, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
+    unsafe { create_queue_from("IDStorageFactoryX::CreateQueue", desc, None, riid, ppv) }
+}
+
+unsafe extern "system" fn factory_create_queue1(_this: *mut c_void, desc: *const u8, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
+    let extra = if desc.is_null() { None } else { Some(unsafe { core::ptr::read_unaligned(desc.add(XQUEUE_DESC_SIZE) as *const u64) }) };
+    unsafe { create_queue_from("IDStorageFactoryX::CreateQueue (slot 10)", desc, extra, riid, ppv) }
 }
 
 unsafe extern "system" fn factory_open_file(_this: *mut c_void, path: *const u16, riid: *const c_void, ppv: *mut *mut c_void) -> i32 {
@@ -1016,7 +1022,7 @@ unsafe extern "system" fn queue_qi(this: *mut c_void, riid: *const c_void, ppv: 
     }
     unsafe { *ppv = core::ptr::null_mut() };
     match unsafe { read_iid(riid) } {
-        Some(i) if i == IID_QUEUE_X || i == IID_IUNKNOWN => {
+        Some(i) if i == IID_QUEUE_X || i == IID_QUEUE_X1 || i == IID_IUNKNOWN => {
             unsafe { queue_add_ref(this) };
             unsafe { qi_out(ppv, this) };
             S_OK

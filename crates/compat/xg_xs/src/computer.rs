@@ -1,6 +1,6 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
-use compat_common::{record, E_NOTIMPL, S_OK};
+use compat_common::{record, E_FAIL, E_NOTIMPL, S_OK};
 use crate::layout::{Layout2D, E_INVALIDARG, LAYOUT_BYTES};
 
 const M: &str = "xg_xs";
@@ -10,6 +10,19 @@ pub struct Computer {
     vtbl: *const Vtbl,
     refs: AtomicU32,
     pub layout: Layout2D,
+}
+
+pub(crate) type GetResourceTiling<T> = unsafe extern "system" fn(
+    *mut T, *mut u32, *mut [u32; 3], *mut [u32; 3], *mut u32, u32, *mut SubresourceTiling,
+) -> i32;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct SubresourceTiling {
+    width: u32,
+    height: u16,
+    depth: u16,
+    start: u32,
 }
 
 #[repr(C)]
@@ -24,7 +37,7 @@ struct Vtbl {
     get_texel_coordinate: unsafe extern "system" fn(*mut Computer, usize, usize, usize, usize, usize, usize) -> i32,
     copy_into: unsafe extern "system" fn(*mut Computer, *mut u8, u32, u32, *const u8, u32, u32) -> i32,
     copy_from: unsafe extern "system" fn(*mut Computer, *mut u8, u32, u32, *const u8, u32, u32) -> i32,
-    tiled: unsafe extern "system" fn(*mut Computer, usize, usize, usize, usize) -> i32,
+    tiled: GetResourceTiling<Computer>,
     view_descriptor: unsafe extern "system" fn(*mut Computer, u32, *mut u8) -> i32,
 }
 
@@ -152,9 +165,74 @@ unsafe extern "system" fn copy_from(this: *mut Computer, data: *mut u8, plane: u
     S_OK
 }
 
-unsafe extern "system" fn tiled(_this: *mut Computer, _a: usize, _b: usize, _c: usize, _d: usize) -> i32 {
-    record(M, "XGTextureAddressComputer::slot10", "[native E_NOTIMPL] tiled resources");
-    E_NOTIMPL
+unsafe extern "system" fn tiled(
+    this: *mut Computer,
+    total: *mut u32,
+    packed: *mut [u32; 3],
+    shape: *mut [u32; 3],
+    count: *mut u32,
+    first: u32,
+    tilings: *mut SubresourceTiling,
+) -> i32 {
+    const TILE: u64 = 64 * 1024;
+    let layout = &(*this).layout;
+    let first_tail = layout.first_tail;
+    let mode = layout.desc.swizzle_mode & 31;
+    if layout.block_bits != 16 || !matches!(mode, 8..=11 | 16..=19 | 24..=27) {
+        return E_FAIL;
+    }
+    let Some(num_subresources) = layout.mips.checked_mul(layout.desc.array_size) else {
+        return E_FAIL;
+    };
+    let Ok(num_tiles) = u32::try_from(layout.total / TILE) else {
+        return E_FAIL;
+    };
+    let entries = if count.is_null() { 0 } else {
+        count.read_unaligned().min(num_subresources.saturating_sub(first))
+    };
+    if entries != 0 && tilings.is_null() {
+        return E_INVALIDARG;
+    }
+    if !total.is_null() {
+        total.write_unaligned(num_tiles);
+    }
+    let tail_mips = layout.mips - first_tail;
+    if !packed.is_null() {
+        let tail_start = if tail_mips == 0 { 0 } else { (layout.mip_offset(first_tail) / TILE) as u32 };
+        packed.write_unaligned([first_tail | tail_mips << 8, u32::from(tail_mips != 0), tail_start]);
+    }
+    if !shape.is_null() {
+        let [width, height, depth] = if first_tail == 0 { [0; 3] } else {
+            [layout.bw * layout.block, layout.bh * layout.block, 1]
+        };
+        shape.write_unaligned([width, height, depth]);
+    }
+    for n in 0..entries {
+        let sub = first + n;
+        let mip = sub % layout.mips;
+        let slice = sub / layout.mips;
+        let record = if mip < first_tail {
+            let level = &layout.mip[mip as usize];
+            SubresourceTiling {
+                width: level.pad_w / layout.bw,
+                height: (level.pad_h / layout.bh) as u16,
+                depth: 1,
+                start: ((u64::from(slice) * layout.slice_size + level.offset) / TILE) as u32,
+            }
+        } else {
+            SubresourceTiling { width: 0, height: 0, depth: 0, start: u32::MAX }
+        };
+        tilings.add(n as usize).write_unaligned(record);
+    }
+    if !count.is_null() {
+        count.write_unaligned(entries);
+    }
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        record(M, "XGTextureAddressComputer::GetResourceTiling",
+            &format!("mode={mode} total={num_tiles} first={first} returned={entries} packed={tail_mips}"));
+    }
+    S_OK
 }
 
 unsafe extern "system" fn view_descriptor(_this: *mut Computer, _plane: u32, _out: *mut u8) -> i32 {
@@ -166,6 +244,32 @@ unsafe extern "system" fn view_descriptor(_this: *mut Computer, _plane: u32, _ou
 mod tests {
     use super::*;
     use crate::layout::{compute, Tex2DDesc};
+
+    #[test]
+    fn reports_tiling_through_slot_ten_and_bounds_the_output() {
+        let desc = Tex2DDesc {
+            width: 512, height: 256, mip_levels: 1, array_size: 2,
+            format: 28, sample_count: 1, swizzle_mode: 25, ..Default::default()
+        };
+        let p = create(compute(&desc).unwrap()) as *mut Computer;
+        let mut total = 0;
+        let mut packed = [0; 3];
+        let mut shape = [0; 3];
+        let mut count = 2;
+        let sentinel = SubresourceTiling { width: 99, height: 0, depth: 0, start: 0 };
+        let mut records = [sentinel; 2];
+        let result = unsafe {
+            let f = (*(*p).vtbl).tiled;
+            let hr = f(p, &mut total, &mut packed, &mut shape, &mut count, 1, records.as_mut_ptr());
+            release(p);
+            hr
+        };
+        assert_eq!(result, S_OK);
+        assert_eq!((total, packed, shape, count), (16, [1, 0, 0], [128, 128, 1], 1));
+        let t = records[0];
+        assert_eq!((t.width, t.height, t.depth, t.start), (4, 2, 1, 8));
+        assert_eq!(records[1].width, 99);
+    }
 
     #[test]
     fn copy_roundtrip() {

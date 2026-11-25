@@ -19,6 +19,7 @@ const W: u32 = 64;
 const H: u32 = 64;
 const FMT_R11G11B10: u32 = 26;
 const FMT_RGBA16F: u32 = 10;
+const FMT_RGBA32F: u32 = 2;
 const ST_RT: u32 = 4;
 const ST_COPY_SOURCE: u32 = 0x800;
 const ST_COPY_DEST: u32 = 0x400;
@@ -110,7 +111,11 @@ unsafe fn rtv_for(dev: usize, res: usize) -> usize {
 }
 
 fn bpp(fmt: u32) -> u32 {
-    if fmt == FMT_RGBA16F { 8 } else { 4 }
+    match fmt {
+        FMT_RGBA32F => 16,
+        FMT_RGBA16F => 8,
+        _ => 4,
+    }
 }
 
 unsafe fn kit(fmt: u32) -> Kit {
@@ -266,7 +271,10 @@ unsafe fn run_adds(k: &mut Kit, mode: Mode, adds: [f32; 3]) -> Vec<[u32; 4]> {
 }
 
 fn channels(fmt: u32, px: &[u8]) -> [u32; 4] {
-    if fmt == FMT_RGBA16F {
+    if fmt == FMT_RGBA32F {
+        let w = |i: usize| u32::from_le_bytes(px[4 * i..4 * i + 4].try_into().unwrap());
+        [w(0), w(1), w(2), w(3)]
+    } else if fmt == FMT_RGBA16F {
         let h = |i: usize| u16::from_le_bytes([px[2 * i], px[2 * i + 1]]) as u32;
         [h(0), h(1), h(2), h(3)]
     } else {
@@ -369,6 +377,36 @@ fn warp_blendclamp_lazy_matches_eager_for_an_additive_chain_that_overflows_to_in
     check(FMT_R11G11B10, &small, 1, &mut bad);
     assert!(bad.is_empty(), "{}", bad.join("
 "));
+}
+
+#[test]
+#[ignore = "needs D3D12 WARP: cargo test -p d3d12_xs --lib warp_blendclamp -- --ignored"]
+fn warp_blendclamp_leaves_fp32_targets_above_the_fp16_range() {
+    if !gpu_free() {
+        return;
+    }
+    if !tombox_xshader::dxc::available() {
+        println!("DXC not available: WARP blendclamp fp32 test not run");
+        return;
+    }
+    let _g = test_api::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (raw, eager, passes) = unsafe {
+        test_api::reset();
+        let mut k = kit(FMT_RGBA32F);
+        test_api::wire(*(k.list as *const *const usize));
+        let raw = run_adds(&mut k, Mode::Raw, [40000.0, 40000.0, 1.0]);
+        test_api::set_lazy(false);
+        let p0 = test_api::passes();
+        let eager = run_adds(&mut k, Mode::Eager, [40000.0, 40000.0, 1.0]);
+        let passes = test_api::passes() - p0;
+        test_api::reset();
+        (raw, eager, passes)
+    };
+    let want = [80001.0f32.to_bits(), 80001.0f32.to_bits(), 80001.0f32.to_bits(), 3.0f32.to_bits()];
+    let centre = (H / 2 * W + W / 2) as usize;
+    assert!(raw.iter().all(|&p| p == want), "raw control: centre {:x?}, want {want:x?}", raw[centre]);
+    assert!(eager.iter().all(|&p| p == want), "eager: centre {:x?} ({}), want {want:x?} (80001.0)", eager[centre], f32::from_bits(eager[centre][0]));
+    assert_eq!(passes, 0, "eager ran clamp passes on an R32G32B32A32_FLOAT target");
 }
 
 fn verdict(fmt: u32, c: [u32; 4]) -> &'static str {

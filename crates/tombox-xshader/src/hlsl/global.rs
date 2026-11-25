@@ -89,10 +89,11 @@ pub fn helpers() -> String {
 
 fn width(m: &str) -> Option<(bool, u8, u8, bool)> {
     Some(match m {
-        "flat_load_ubyte" => (false, 1, 1, false),
-        "flat_load_sbyte" => (false, 1, 1, true),
+        "flat_load_ubyte" | "flat_load_ubyte_d16" | "flat_load_ubyte_d16_hi" => (false, 1, 1, false),
+        "flat_load_sbyte" | "flat_load_sbyte_d16" | "flat_load_sbyte_d16_hi" => (false, 1, 1, true),
         "flat_load_ushort" => (false, 1, 2, false),
         "flat_load_sshort" => (false, 1, 2, true),
+        "flat_load_short_d16" | "flat_load_short_d16_hi" => (false, 1, 2, false),
         "flat_load_dword" => (false, 1, 4, false),
         "flat_load_dwordx2" => (false, 2, 4, false),
         "flat_load_dwordx3" => (false, 3, 4, false),
@@ -194,7 +195,18 @@ impl<'a> Emitter<'a> {
         let loads: Vec<String> = (0..n).map(|k| format!("g{t}_{k} = {};", self.global_load_expr(&g, k, bytes, signed))).collect();
         self.line(&format!("if (exec_lo & 1u) {{ {} }}", loads.join(" ")));
         for k in 0..n {
-            self.wv(&Opnd::Vgpr(vd + k), &format!("g{t}_{k}"))?;
+            let o = Opnd::Vgpr(vd + k);
+            let e = format!("g{t}_{k}");
+            let e = if m.ends_with("_d16_hi") {
+                self.touch(&o);
+                format!("((({}) & 0xffffu) | (({e}) << 16u))", r(&o)?)
+            } else if m.ends_with("_d16") {
+                self.touch(&o);
+                format!("((({}) & 0xffff0000u) | (({e}) & 0xffffu))", r(&o)?)
+            } else {
+                e
+            };
+            self.wv(&o, &e)?;
         }
         Ok(())
     }

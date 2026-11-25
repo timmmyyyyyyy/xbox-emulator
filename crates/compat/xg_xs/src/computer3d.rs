@@ -26,7 +26,7 @@ struct Vtbl {
     get_texel_coordinate: unsafe extern "system" fn(*mut Computer3D, usize, usize, usize, usize, usize, usize) -> i32,
     copy_into: unsafe extern "system" fn(*mut Computer3D, *mut u8, u32, u32, *const u8, u32, u32) -> i32,
     copy_from: unsafe extern "system" fn(*mut Computer3D, *mut u8, u32, u32, *const u8, u32, u32) -> i32,
-    tiled: unsafe extern "system" fn(*mut Computer3D, usize, usize, usize, usize) -> i32,
+    tiled: crate::computer::GetResourceTiling<Computer3D>,
     view_descriptor: unsafe extern "system" fn(*mut Computer3D, u32, *mut u8) -> i32,
 }
 
@@ -137,7 +137,15 @@ unsafe extern "system" fn copy_from(_this: *mut Computer3D, _data: *mut u8, _pla
     E_INVALIDARG
 }
 
-unsafe extern "system" fn tiled(_this: *mut Computer3D, _a: usize, _b: usize, _c: usize, _d: usize) -> i32 {
+unsafe extern "system" fn tiled(
+    _this: *mut Computer3D,
+    _total: *mut u32,
+    _packed: *mut [u32; 3],
+    _shape: *mut [u32; 3],
+    _count: *mut u32,
+    _first: u32,
+    _tilings: *mut crate::computer::SubresourceTiling,
+) -> i32 {
     record(M, "XGTextureAddressComputer::slot10", "[native E_NOTIMPL] tiled resources (1D/3D)");
     E_NOTIMPL
 }

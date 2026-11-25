@@ -56,6 +56,15 @@ pub struct Layout {
     pub slots: [u32; SLOTS],
 }
 
+pub const LAYOUT_19041: Layout = Layout {
+    build: "19041",
+    from_title: 0x19fc0,
+    singleton_bytes: 0xae8,
+    runtime_bytes: 0x9d0,
+    runtime_ctor: 0x12cd0,
+    slots: [0x19930, 0x19950, 0x19220, 0x19a40, 0x19a70, 0x19ab0, 0x19a60, 0x19240, 0x19b00, 0x19c40, 0x19dc0, 0x19f40, 0x19f60, 0x19f80, 0x19fa0],
+};
+
 pub const LAYOUT_22000: Layout = Layout {
     build: "22000 (XDefiant, Terraria)",
     from_title: 0x234a0,
@@ -76,6 +85,7 @@ pub const LAYOUT_22621: Layout = Layout {
 
 pub fn layout(os_build: u32) -> Option<Layout> {
     match os_build {
+        19041 => Some(LAYOUT_19041),
         22621.. => Some(LAYOUT_22621),
         22000.. => Some(LAYOUT_22000),
         _ => None,
@@ -149,6 +159,7 @@ pub(crate) fn record(what: &str, detail: &str) {
 
 #[derive(Clone, Copy)]
 pub struct XbtpFns {
+    pub session_io: fn() -> Option<SessionIo>,
     pub init_system: unsafe extern "C" fn() -> i32,
     pub create: unsafe extern "C" fn() -> *mut u8,
     pub listen: unsafe extern "C" fn(*mut u8, *mut c_void, u16, *mut Handle) -> i32,
@@ -178,6 +189,7 @@ fn load_xbtp() -> Option<XbtpFns> {
             return None;
         }
         Some(XbtpFns {
+            session_io: load_session_io,
             init_system: core::mem::transmute::<usize, unsafe extern "C" fn() -> i32>(i),
             create: core::mem::transmute::<usize, unsafe extern "C" fn() -> *mut u8>(c),
             listen: core::mem::transmute::<usize, unsafe extern "C" fn(*mut u8, *mut c_void, u16, *mut Handle) -> i32>(l),
@@ -325,6 +337,14 @@ fn create_pix_dir() -> bool {
     }
 }
 
+pub fn affinity_mask_for_build(build: u32, process_mask: usize) -> usize {
+    if build == 19041 {
+        if process_mask & 0x40 == 0 { 0x30 } else { 0x60 }
+    } else {
+        affinity_mask(process_mask)
+    }
+}
+
 pub fn affinity_mask(process_mask: usize) -> usize {
     if process_mask > AFFINITY_SPLIT {
         AFFINITY_WIDE
@@ -339,7 +359,7 @@ pub(crate) unsafe fn pin_thread() -> usize {
     if !ok {
         record("thread affinity", "PixRT::GetMinimalTitleImpactProcessorAffinityMask - GetProcessAffinityMask call failed");
     }
-    let m = affinity_mask(p);
+    let m = affinity_mask_for_build(compat_common::os_host::routes::current_build(), p);
     SetThreadAffinityMask(GetCurrentThread(), m);
     m
 }
@@ -384,7 +404,7 @@ pub struct Transport {
 }
 
 impl Transport {
-    const fn new() -> Transport {
+    pub const fn new() -> Transport {
         Transport { cs: Mutex::new(()), cancelled: AtomicU32::new(0), connected: AtomicU32::new(0), mode: AtomicU32::new(0), kind: AtomicU32::new(0), link: Mutex::new(None), accepted: AtomicUsize::new(0) }
     }
 
@@ -445,7 +465,106 @@ unsafe fn xbtp_listen_accept(x: &XbtpFns, link: &mut XbtpLink, service: u16, tim
     }
 }
 
-unsafe fn connect(t: &Transport) -> i32 {
+unsafe fn release_listener(x: &XbtpFns, handle: usize) {
+    let mut listeners = lock(&LISTENERS);
+    let Some(index) = listeners.iter().position(|l| l.handle == handle) else {
+        record("device engine", "PIX listener was not found during release");
+        return;
+    };
+    listeners[index].refs -= 1;
+    if listeners[index].refs == 0 {
+        let listener = listeners.swap_remove(index);
+        (x.close)(listener.handle as *mut u8);
+    }
+    mirror_refs(&listeners);
+}
+
+#[repr(C)]
+pub struct SendBuffer {
+    pub len: u32,
+    pub data: *const u8,
+}
+
+type RecvFn = unsafe extern "C" fn(*mut u8, *mut u8, u32, *mut u32, u32, *mut c_void) -> i32;
+type SendFn = unsafe extern "C" fn(*mut u8, *const SendBuffer, u32, *mut u32, u32, *mut c_void) -> i32;
+
+#[derive(Clone, Copy)]
+pub struct SessionIo {
+    pub recv: RecvFn,
+    pub send: SendFn,
+}
+
+fn load_session_io() -> Option<SessionIo> {
+    unsafe {
+        let module = GetModuleHandleW(wide("xbtp.dll").as_ptr());
+        if module == 0 { return None; }
+        let recv = GetProcAddress(module, b"XbtpLinkRecv\0".as_ptr());
+        let send = GetProcAddress(module, b"XbtpLinkSend\0".as_ptr());
+        if recv == 0 || send == 0 { return None; }
+        Some(SessionIo {
+            recv: core::mem::transmute::<usize, RecvFn>(recv),
+            send: core::mem::transmute::<usize, SendFn>(send),
+        })
+    }
+}
+
+struct AcceptedLink {
+    handle: *mut u8,
+    io: SessionIo,
+}
+
+impl std::io::Read for AcceptedLink {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let len = out.len().min(u32::MAX as usize) as u32;
+        let mut received = 0;
+        let hr = unsafe { (self.io.recv)(self.handle, out.as_mut_ptr(), len, &mut received, 0, core::ptr::null_mut()) };
+        if hr < 0 || received > len {
+            return Err(std::io::Error::other(format!("XBTP receive returned {hr:#x}, {received} bytes")));
+        }
+        Ok(received as usize)
+    }
+}
+
+impl std::io::Write for AcceptedLink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let buffer = SendBuffer { len: bytes.len().min(0x100_0000) as u32, data: bytes.as_ptr() };
+        let mut sent = 0;
+        let hr = unsafe { (self.io.send)(self.handle, &buffer, 1, &mut sent, 0, core::ptr::null_mut()) };
+        if hr < 0 || sent < 0x80 || sent - 0x80 > buffer.len {
+            return Err(std::io::Error::other(format!("XBTP send returned {hr:#x}, {sent} bytes")));
+        }
+        Ok((sent - 0x80) as usize)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+unsafe fn accepted_device_session(handle: *mut u8, init_flags: u32, io: impl FnOnce() -> Option<SessionIo>) -> i32 {
+    if compat_common::os_host::routes::current_build() != 19041 {
+        record("device engine", "a PIX tool connected on xbtp service 0x1080; the session setup 0x3a790 and the device-engine request dispatch 0x1b4e7 are not ported, so the connection is closed");
+        return E_NOTIMPL;
+    }
+    if handle.is_null() || handle.cast::<usize>().read_unaligned() & 0xffff_0000_0000 != 0x4c44_0000_0000 {
+        record("device engine", "build 19041 PIX sessions require an in-process XBTP device");
+        return E_NOTIMPL;
+    }
+    let Some(io) = io() else { return E_FAIL };
+    let wire = AcceptedLink { handle, io };
+    let mut session = super::transport_stream::Messages::new(wire, TRANSPORT[12] as usize, TRANSPORT[3] as usize);
+    match session.serve_19041(init_flags) {
+        Ok(()) => S_OK,
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            record("device engine", "PIX peer disconnected during a message");
+            S_OK
+        }
+        Err(error) => {
+            record("device engine", &format!("PIX device session ended: {error}"));
+            if error.kind() == std::io::ErrorKind::Unsupported { E_NOTIMPL } else { E_FAIL }
+        }
+    }
+}
+
+pub unsafe fn run_device_connection(t: &Transport, init_flags: u32) -> i32 {
     let g = lock(&t.cs);
     if t.cancelled.load(Ordering::SeqCst) != 0 {
         return HR_CANCELLED;
@@ -474,27 +593,39 @@ unsafe fn connect(t: &Transport) -> i32 {
         return hr;
     }
     let cancel = CreateEventW(core::ptr::null_mut(), 0, 0, core::ptr::null());
+    if cancel == 0 {
+        let hr = hr_from_win32(GetLastError());
+        *lock(&SYSTEM_REFS) -= 1;
+        return hr;
+    }
     *lock(&t.link) = Some(XbtpLink { cancel, listener: 0, ready: 0, accepted: 0 });
     drop(g);
     QueryPerformanceCounter(&mut q);
     let mut link = XbtpLink { cancel, listener: 0, ready: 0, accepted: 0 };
     let hr = xbtp_listen_accept(&x, &mut link, TRANSPORT[1] as u16, TRANSPORT[2]);
+    let result = if hr >= 0 {
+        t.accepted.store(link.accepted, Ordering::SeqCst);
+        accepted_device_session(link.accepted as *mut u8, init_flags, x.session_io)
+    } else {
+        hr
+    };
     let _g = lock(&t.cs);
-    if hr < 0 {
-        *lock(&t.link) = None;
-        return hr;
+    if hr >= 0 {
+        t.accepted.store(0, Ordering::SeqCst);
+        (x.close)(link.accepted as *mut u8);
     }
-    t.accepted.store(link.accepted, Ordering::SeqCst);
-    record(
-        "device engine",
-        "a PIX tool connected on xbtp service 0x1080; the session setup 0x3a790 and the device-engine request dispatch 0x1b4e7 are not ported, so the connection is closed",
-    );
-    (x.close)(link.accepted as *mut u8);
-    *lock(&t.link) = None;
-    E_NOTIMPL
+    if link.listener != 0 {
+        release_listener(&x, link.listener);
+    }
+    *lock(&SYSTEM_REFS) -= 1;
+    let mut published = lock(&t.link);
+    *published = None;
+    CloseHandle(cancel);
+    result
 }
 
 pub struct Runtime {
+    legacy_workers: bool,
     pub block: usize,
     pub magic: u32,
     pub version: u32,
@@ -530,9 +661,11 @@ unsafe extern "system" fn device_thread(p: *mut c_void) -> u32 {
         if WaitForSingleObject(rt.shutdown, 0) == 0 {
             return 0;
         }
-        let hr = connect(&rt.device);
+        let hr = run_device_connection(&rt.device, u32::from(rt.flag));
         if hr >= 0 {
-            SetEvent(rt.connected);
+            if !rt.legacy_workers {
+                SetEvent(rt.connected);
+            }
             continue;
         }
         if WaitForSingleObject(rt.shutdown, 0) == 0 {
@@ -561,6 +694,13 @@ unsafe extern "system" fn notification_thread(p: *mut c_void) -> u32 {
     let rt = &*(p as *const Runtime);
     rt.affinity[2].store(pin_thread(), Ordering::SeqCst);
     rt.started[2].store(true, Ordering::SeqCst);
+    if rt.legacy_workers {
+        let events = [rt.notify, rt.connected, rt.shutdown];
+        while WaitForMultipleObjects(3, events.as_ptr(), 0, u32::MAX) < 2 {
+            record("notification", "19041 capture notifications are not ported");
+        }
+        return 0;
+    }
     let w = [rt.notify, rt.shutdown];
     while WaitForMultipleObjects(2, w.as_ptr(), 0, u32::MAX) == 0 {
         record("notification", "notification event signalled; the notification send 0x1ad0c is not ported");
@@ -573,7 +713,8 @@ pub(crate) unsafe fn runtime_new(layout: &Layout, magic: u32, version: u32, flag
     if block == 0 {
         return None;
     }
-    let connected = CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null());
+    let legacy_workers = *layout == LAYOUT_19041;
+    let connected = CreateEventW(core::ptr::null_mut(), i32::from(!legacy_workers), 0, core::ptr::null());
     let pix_dir_created = create_pix_dir();
     let c = context();
     *lock(&c.pix_dir) = PIX_DIR.to_string();
@@ -582,6 +723,7 @@ pub(crate) unsafe fn runtime_new(layout: &Layout, magic: u32, version: u32, flag
     let shutdown = CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null());
     let notify = CreateEventW(core::ptr::null_mut(), 0, 0, core::ptr::null());
     let rt: &'static Runtime = Box::leak(Box::new(Runtime {
+        legacy_workers,
         block,
         magic,
         version,
@@ -607,10 +749,14 @@ pub(crate) unsafe fn runtime_new(layout: &Layout, magic: u32, version: u32, flag
     set_capture_interface(rt as *const Runtime as usize + 8, 0);
     let procs: [ThreadProc; 3] = [device_thread, capture_thread, notification_thread];
     for (i, f) in procs.into_iter().enumerate() {
+        if legacy_workers && i == 1 {
+            continue;
+        }
         let h = CreateThread(core::ptr::null_mut(), 0, f, rt as *const Runtime as *mut c_void, 0, core::ptr::null_mut());
         rt.threads[i].store(h, Ordering::SeqCst);
         if h != 0 {
-            SetThreadDescription(h, wide(THREAD_NAMES[i]).as_ptr());
+            let name = if legacy_workers && i == 0 { "PIX::InteractiveRuntime(engine request)" } else { THREAD_NAMES[i] };
+            SetThreadDescription(h, wide(name).as_ptr());
         }
     }
     Some(rt)
@@ -731,16 +877,23 @@ pub fn runtime() -> Option<&'static Runtime> {
 unsafe fn ensure_runtime(s: &Singleton, magic: u32, version: u32, flags: u32) -> i32 {
     let mut r = lock(&s.runtime);
     if r.is_none() && !s.constructing.load(Ordering::SeqCst) {
+        if s.layout == LAYOUT_19041 && flags & 1 == 0 && console_sandbox::fs::drive_dir('D').join("PIX_ForceTCP").exists() {
+            record("PixDllInitializeFromTitle", "19041 requested the unsupported TCP transport");
+            return E_NOTIMPL;
+        }
         s.constructing.store(true, Ordering::SeqCst);
         *r = runtime_new(&s.layout, magic, version, flags);
         s.constructing.store(false, Ordering::SeqCst);
+        if r.is_none() && s.layout == LAYOUT_19041 {
+            return E_OUTOFMEMORY;
+        }
     }
     S_OK
 }
 
 pub unsafe extern "system" fn from_title(magic: u32, version: u32, flags: u32, table: *mut c_void, bytes: u32) -> i32 {
     let Some(layout) = layout(os_build()) else {
-        record("PixDllInitializeFromTitle", "this console build's pixrt10 (19041: 0xae8-byte singleton, two-thread runtime, d:\\PIX_ForceTCP) is not ported");
+        record("PixDllInitializeFromTitle", "this console build's pixrt10 title initializer is not ported");
         return E_NOTIMPL;
     };
     context();
@@ -858,11 +1011,18 @@ pub unsafe extern "system" fn end_capture(arg: u32) -> i32 {
     }
     let mut code = 0u32;
     let hr = if GetExitCodeThread(0, &mut code) != 0 { code as i32 } else { hr_from_win32(GetLastError()) };
+    let legacy = os_build() == 19041;
+    if legacy && hr < 0 {
+        return hr;
+    }
     let _g = lock(&CAPTURE_CS);
     CAPTURE.state.store(0, Ordering::SeqCst);
     let h = CAPTURE.handler.load(Ordering::SeqCst) as *const CaptureHandler;
     if !h.is_null() {
         ((*h).end)((*h).ctx);
+    }
+    if legacy {
+        return if h.is_null() { S_FALSE } else { S_OK };
     }
     if CAPTURE.pending_if.swap(0, Ordering::SeqCst) != 0 {
         set_capture_interface(0, 0);

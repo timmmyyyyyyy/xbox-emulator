@@ -97,6 +97,7 @@ mod sample_pattern;
 mod pso_serial;
 mod dma_list;
 mod cmdlist_x;
+mod cl_edition;
 mod query_x;
 mod gpu_va;
 mod fill;
@@ -185,8 +186,37 @@ static IID_ID3D12DEBUG: device_wrap::Guid = device_wrap::Guid {
     d1: 0x3444_88b7, d2: 0x6846, d3: 0x474b, d4: [0xb9, 0x89, 0xf0, 0x27, 0x44, 0x82, 0x45, 0xe0],
 };
 
+static IID_ID3D12DEBUG1: device_wrap::Guid = device_wrap::Guid {
+    d1: 0xaffa_a4ca, d2: 0x63fe, d3: 0x4d8e, d4: [0xb8, 0xad, 0x15, 0x90, 0x00, 0xaf, 0x43, 0x04],
+};
+
 /// Enable the D3D12 debug layer (best-effort) so validation errors are emitted via
 /// OutputDebugString and captured by the tracer. Gated on env TOMBOX_D3D12_DEBUG.
+fn gbv_requested(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1") | Some("on"))
+}
+
+#[cfg(test)]
+mod gbv_tests {
+    use super::*;
+
+    #[test]
+    fn gbv_is_opt_in() {
+        assert!(gbv_requested(Some("1")));
+        assert!(gbv_requested(Some(" on ")));
+        assert!(!gbv_requested(None));
+        assert!(!gbv_requested(Some("0")));
+        assert!(!gbv_requested(Some("off")));
+        assert!(!gbv_requested(Some("yes")));
+    }
+
+    #[test]
+    fn debug1_iid_is_the_sdk_layers_value() {
+        let g = &IID_ID3D12DEBUG1;
+        assert_eq!((g.d1, g.d2, g.d3, g.d4), (0xaffa_a4ca, 0x63fe, 0x4d8e, [0xb8, 0xad, 0x15, 0x90, 0x00, 0xaf, 0x43, 0x04]));
+    }
+}
+
 fn maybe_enable_debug_layer(params: *const c_void) {
     if !unsafe { process_debug::on_create_device(params, std::env::var("TOMBOX_D3D12_DEBUG").is_ok()) } {
         return;
@@ -204,6 +234,21 @@ fn maybe_enable_debug_layer(params: *const c_void) {
             let vt = *(dbg as *const *const usize);
             let enable: unsafe extern "system" fn(*mut c_void) = core::mem::transmute(*vt.add(3)); // EnableDebugLayer
             enable(dbg);
+            if gbv_requested(std::env::var("TOMBOX_D3D12_GBV").ok().as_deref()) {
+                let qi: unsafe extern "system" fn(*mut c_void, *const device_wrap::Guid, *mut *mut c_void) -> i32 = core::mem::transmute(*vt);
+                let mut d1: *mut c_void = core::ptr::null_mut();
+                let hr1 = qi(dbg, &IID_ID3D12DEBUG1, &mut d1);
+                if hr1 == 0 && !d1.is_null() {
+                    let vt1 = *(d1 as *const *const usize);
+                    let gbv: unsafe extern "system" fn(*mut c_void, i32) = core::mem::transmute(*vt1.add(4));
+                    gbv(d1, 1);
+                    let rel1: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*vt1.add(2));
+                    rel1(d1);
+                    record(M, "debug", "D3D12 GPU-based validation ENABLED (TOMBOX_D3D12_GBV=1)");
+                } else {
+                    record(M, "debug", &format!("ID3D12Debug1 unavailable hr={hr1:#010x}; GPU-based validation not enabled"));
+                }
+            }
             let rel: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*vt.add(2));
             rel(dbg);
         }

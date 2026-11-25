@@ -1340,6 +1340,54 @@ pub fn verify_termination_cancels_delayed_callbacks() {
     }
 }
 
+pub fn verify_termination_order_on_a_manual_queue() {
+    let a = api();
+    let q = a.create(MANUAL, MANUAL);
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let phase = Arc::new(AtomicU32::new(0));
+    let note = |name: &'static str| {
+        let (l, p) = (log.clone(), phase.clone());
+        move |canceled: bool| l.lock().unwrap().push(format!("{name} {} in {}", if canceled { "canceled" } else { "ran" }, ["no dispatch", "work dispatch", "completion dispatch"][p.load(SeqCst) as usize]))
+    };
+    assert_eq!(a.submit(q, WORK, 10000, note("delayed work")), 0);
+    assert_eq!(a.submit(q, COMPLETION, 10000, note("delayed completion")), 0);
+    assert_eq!(a.submit(q, WORK, 0, note("queued work")), 0);
+    assert_eq!(a.submit(q, COMPLETION, 0, note("queued completion")), 0);
+    let (l, p) = (log.clone(), phase.clone());
+    assert_eq!(a.terminate(q, false, Some(Box::new(move || l.lock().unwrap().push(format!("terminated in {}", ["no dispatch", "work dispatch", "completion dispatch"][p.load(SeqCst) as usize]))))), 0);
+    let after_terminate = (a.submit(q, WORK, 0, note("late work")), a.submit(q, COMPLETION, 0, note("late completion")));
+    let before_dispatch = log.lock().unwrap().clone();
+    phase.store(1, SeqCst);
+    while a.dispatch(q, WORK, 0) {}
+    phase.store(0, SeqCst);
+    let after_work = (a.submit(q, WORK, 0, note("later work")), a.submit(q, COMPLETION, 0, note("later completion")));
+    let end = Instant::now() + Duration::from_secs(2);
+    while !log.lock().unwrap().iter().any(|e| e.starts_with("terminated")) && Instant::now() < end {
+        phase.store(2, SeqCst);
+        while a.dispatch(q, COMPLETION, 0) {}
+        phase.store(1, SeqCst);
+        while a.dispatch(q, WORK, 0) {}
+        phase.store(0, SeqCst);
+    }
+    let at_end = (a.submit(q, WORK, 0, note("last work")), a.submit(q, COMPLETION, 0, note("last completion")));
+    assert_eq!(after_terminate, (E_ABORT, 0), "right after XTaskQueueTerminate the work port refuses and the completion port still accepts");
+    assert!(before_dispatch.is_empty(), "nothing is canceled before its port is dispatched: {before_dispatch:?}");
+    assert_eq!(after_work, (E_ABORT, E_ABORT), "once the work port has drained, the completion port refuses too");
+    assert_eq!(at_end, (E_ABORT, E_ABORT), "a terminated queue takes no new work");
+    assert_eq!(
+        *log.lock().unwrap(),
+        [
+            "queued work canceled in work dispatch",
+            "delayed work canceled in work dispatch",
+            "queued completion canceled in completion dispatch",
+            "late completion canceled in completion dispatch",
+            "delayed completion canceled in completion dispatch",
+            "terminated in completion dispatch",
+        ]
+    );
+    a.close(q);
+}
+
 pub fn verify_close_keeps_queued_callbacks() {
     let a = api();
     let q = a.create(SERIALIZED, SERIALIZED);
@@ -2005,6 +2053,124 @@ pub fn verify_pending_begin_stays_pending() {
     a.close(q);
 }
 
+const BEGIN_FAILURE: i32 = 0x8009_1234u32 as i32;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Completes {
+    BeginReturns,
+    InsideBegin,
+    FromAnotherThreadInBegin,
+    InDoWork,
+    InDoWorkWithPayload,
+}
+
+struct BeginCase {
+    ops: [AtomicU32; 5],
+    hr: i32,
+    how: Completes,
+}
+
+unsafe extern "system" fn begin_case_provider(op: u32, d: *const Data) -> i32 {
+    let c = &*((*d).context as *const BeginCase);
+    c.ops[op as usize].fetch_add(1, SeqCst);
+    match (op, c.how) {
+        (OP_BEGIN, Completes::BeginReturns) => c.hr,
+        (OP_BEGIN, Completes::InsideBegin) => {
+            api().complete((*d).block, c.hr, 0);
+            0
+        }
+        (OP_BEGIN, Completes::FromAnotherThreadInBegin) => {
+            let (b, hr) = ((*d).block as usize, c.hr);
+            std::thread::spawn(move || api().complete(b as *mut Block, hr, 0)).join().unwrap();
+            0
+        }
+        (OP_BEGIN, _) => api().schedule((*d).block, 0),
+        (OP_DO_WORK, how) => {
+            api().complete((*d).block, c.hr, if how == Completes::InDoWorkWithPayload { 4 } else { 0 });
+            E_PENDING
+        }
+        _ => 0,
+    }
+}
+
+fn begin_case(hr: i32, how: Completes) -> BeginCase {
+    BeginCase { ops: Default::default(), hr, how }
+}
+
+fn op_counts(c: &BeginCase) -> [u32; 5] {
+    core::array::from_fn(|i| c.ops[i].load(SeqCst))
+}
+
+pub fn verify_failed_begin_reports_its_failure() {
+    let a = api();
+    let q = a.create(MANUAL, MANUAL);
+    let case = begin_case(BEGIN_FAILURE, Completes::BeginReturns);
+    let mut b = Block::new(q);
+    let done = counter();
+    let in_callback = Arc::new(AtomicI32::new(0));
+    let (c, s) = (done.clone(), in_callback.clone());
+    on_done(&mut b, move |b| {
+        s.store(api().status(b, false), SeqCst);
+        c.fetch_add(1, SeqCst);
+    });
+    assert_eq!(a.begin(&mut *b, &case as *const _ as usize, 0, begin_case_provider), 0, "XAsyncBegin succeeds even when the Begin op fails");
+    assert_eq!(a.status(&mut *b, false), BEGIN_FAILURE, "XAsyncGetStatus right after XAsyncBegin returned");
+    let mut size = 7usize;
+    assert_eq!(a.result_size(&mut *b, &mut size), BEGIN_FAILURE);
+    assert_eq!(done.load(SeqCst), 0, "the completion callback waits for its port");
+    assert_eq!(a.schedule(&mut *b, 0), BEGIN_FAILURE, "XAsyncSchedule on a call its Begin failed");
+    assert!(!a.dispatch(q, WORK, 0), "a failed Begin queues no work");
+    assert!(a.dispatch(q, COMPLETION, 0), "the completion callback of a failed Begin is queued");
+    assert_eq!((done.load(SeqCst), in_callback.load(SeqCst)), (1, BEGIN_FAILURE), "callback count and the status it read");
+    assert!(!a.dispatch(q, COMPLETION, 0));
+    assert_eq!(a.status(&mut *b, false), BEGIN_FAILURE);
+    assert_eq!(a.schedule(&mut *b, 0), BEGIN_FAILURE);
+    assert!(!a.dispatch(q, WORK, 0));
+    assert_eq!(op_counts(&case), [1, 0, 0, 0, 1], "ops seen as [Begin, DoWork, GetResult, Cancel, Cleanup]");
+    a.close(q);
+}
+
+pub fn verify_cleanup_waits_for_the_callback_when_begin_completes() {
+    let a = api();
+    for how in [Completes::BeginReturns, Completes::InsideBegin, Completes::FromAnotherThreadInBegin, Completes::InDoWork, Completes::InDoWorkWithPayload] {
+        for hr in [BEGIN_FAILURE, 0] {
+            for with_callback in [true, false] {
+                if how == Completes::BeginReturns && hr == 0 {
+                    continue;
+                }
+                let what = format!("case {} hr {hr:#x} callback {with_callback}", how as u32);
+                let q = a.create(MANUAL, MANUAL);
+                let case = begin_case(hr, how);
+                let cp = &case as *const BeginCase as usize;
+                let mut b = Block::new(q);
+                let seen = Arc::new(AtomicI32::new(-1));
+                let s = seen.clone();
+                if with_callback {
+                    on_done(&mut b, move |_| s.store(unsafe { &*(cp as *const BeginCase) }.ops[OP_CLEANUP as usize].load(SeqCst) as i32, SeqCst));
+                }
+                assert_eq!(a.begin(&mut *b, cp, 0, begin_case_provider), 0, "{what}");
+                let in_begin = how != Completes::InDoWork && how != Completes::InDoWorkWithPayload;
+                assert_eq!(a.dispatch(q, WORK, 0), !in_begin, "{what}");
+                assert_eq!(a.status(&mut *b, false), hr, "{what}");
+                let payload = how == Completes::InDoWorkWithPayload && hr == 0;
+                let early = if payload || (in_begin && with_callback) { 0 } else { 1 };
+                assert_eq!(op_counts(&case)[OP_CLEANUP as usize], early, "{what}: Cleanup ops before the completion port is dispatched");
+                assert_eq!(a.dispatch(q, COMPLETION, 0), with_callback, "{what}");
+                if with_callback {
+                    assert_eq!(seen.load(SeqCst), early as i32, "{what}: Cleanup ops the completion callback saw");
+                }
+                assert_eq!(op_counts(&case)[OP_CLEANUP as usize], if payload { 0 } else { 1 }, "{what}: Cleanup ops after the completion callback");
+                let works = op_counts(&case)[OP_DO_WORK as usize];
+                let again = a.schedule(&mut *b, 0);
+                assert_eq!(again, if hr < 0 { hr } else if payload { 0 } else { E_INVALIDARG }, "{what}: XAsyncSchedule on the completed call");
+                assert_eq!(a.dispatch(q, WORK, 0), payload, "{what}");
+                assert_eq!(op_counts(&case)[OP_DO_WORK as usize], works + payload as u32, "{what}");
+                a.close(q);
+            }
+        }
+    }
+}
+
 pub fn verify_zero_payload_cleans_up_fast() {
     let a = api();
     let q = a.create(MANUAL, MANUAL);
@@ -2218,6 +2384,166 @@ pub fn verify_result_buffer_checks() {
     a.close(q);
 }
 
+pub fn verify_cancel_leaves_completion_to_the_provider() {
+    let a = api();
+    let q = a.create(MANUAL, MANUAL);
+    let case = begin_case(0, Completes::InDoWork);
+    let mut b = Block::new(q);
+    let done = counter();
+    let d = done.clone();
+    on_done(&mut b, move |_| {
+        d.fetch_add(1, SeqCst);
+    });
+    assert_eq!(a.begin(&mut *b, &case as *const _ as usize, 0, begin_case_provider), 0);
+    a.cancel(&mut *b);
+    let after_cancel = (op_counts(&case)[OP_CANCEL as usize], a.status(&mut *b, false), a.dispatch(q, COMPLETION, 0), done.load(SeqCst));
+    let work_ran = a.dispatch(q, WORK, 0);
+    let after_work = (op_counts(&case)[OP_DO_WORK as usize], a.status(&mut *b, false), a.dispatch(q, COMPLETION, 0), done.load(SeqCst));
+    a.cancel(&mut *b);
+    let cancels = op_counts(&case)[OP_CANCEL as usize];
+    assert_eq!(
+        (after_cancel, work_ran, after_work, cancels),
+        ((1, E_PENDING, false, 0), true, (1, 0, true, 1), 1),
+        "scheduled call: [Cancel ops, status, completion queued, callbacks] after XAsyncCancel, DoWork dispatched, the same after DoWork, Cancel ops after a second XAsyncCancel on the completed call"
+    );
+
+    let idle = begin_case(0, Completes::BeginReturns);
+    let mut b = Block::new(q);
+    let done = counter();
+    let d = done.clone();
+    on_done(&mut b, move |_| {
+        d.fetch_add(1, SeqCst);
+    });
+    assert_eq!(a.begin(&mut *b, &idle as *const _ as usize, 0, begin_case_provider), 0);
+    a.cancel(&mut *b);
+    let after_cancel = (op_counts(&idle)[OP_CANCEL as usize], a.status(&mut *b, false), a.dispatch(q, COMPLETION, 0), done.load(SeqCst));
+    a.complete(&mut *b, E_ABORT, 0);
+    let after_complete = (a.status(&mut *b, false), a.dispatch(q, COMPLETION, 0), done.load(SeqCst));
+    assert_eq!(
+        (after_cancel, after_complete),
+        ((1, E_PENDING, false, 0), (E_ABORT, true, 1)),
+        "unscheduled call: [Cancel ops, status, completion queued, callbacks] after XAsyncCancel, then [status, completion queued, callbacks] after the provider completes with E_ABORT"
+    );
+    assert!(!a.dispatch(q, WORK, 0));
+
+    let mut seen = Vec::new();
+    for with_callback in [false, true] {
+        let probe = CancelProbe { ops: Default::default(), cleanups_in_cancel: AtomicU32::new(u32::MAX) };
+        let mut b = Block::new(q);
+        if with_callback {
+            on_done(&mut b, |_| {});
+        }
+        assert_eq!(a.begin(&mut *b, &probe as *const _ as usize, 0, completes_in_cancel), 0);
+        a.cancel(&mut *b);
+        let after_cancel = probe.ops[OP_CLEANUP as usize].load(SeqCst);
+        let queued = a.dispatch(q, COMPLETION, 0);
+        seen.push((probe.cleanups_in_cancel.load(SeqCst), after_cancel, queued, probe.ops[OP_CLEANUP as usize].load(SeqCst), a.status(&mut *b, false)));
+    }
+    assert_eq!(
+        seen,
+        [(0, 1, false, 1, E_ABORT), (0, 0, true, 1, E_ABORT)],
+        "provider completing inside its Cancel op, without then with a callback: [Cleanup ops seen inside Cancel, after XAsyncCancel returned, completion queued, Cleanup ops after the completion port, status]"
+    );
+    a.close(q);
+}
+
+struct CancelProbe {
+    ops: [AtomicU32; 5],
+    cleanups_in_cancel: AtomicU32,
+}
+
+unsafe extern "system" fn completes_in_cancel(op: u32, d: *const Data) -> i32 {
+    let p = &*((*d).context as *const CancelProbe);
+    p.ops[op as usize].fetch_add(1, SeqCst);
+    if op == OP_CANCEL {
+        api().complete((*d).block, E_ABORT, 0);
+        p.cleanups_in_cancel.store(p.ops[OP_CLEANUP as usize].load(SeqCst), SeqCst);
+    }
+    0
+}
+
+unsafe extern "system" fn delayed_work_provider(op: u32, d: *const Data) -> i32 {
+    let ops = &*((*d).context as *const [AtomicU32; 5]);
+    ops[op as usize].fetch_add(1, SeqCst);
+    if op == OP_BEGIN {
+        return api().schedule((*d).block, 10000);
+    }
+    0
+}
+
+pub fn verify_canceled_work_cancels_the_provider() {
+    let a = api();
+    let q = thread_pool_queue();
+    let ops: [AtomicU32; 5] = Default::default();
+    let mut b = Block::new(q);
+    assert_eq!(a.begin(&mut *b, &ops as *const _ as usize, 0, delayed_work_provider), 0);
+    let ended = Arc::new(Event::new(true));
+    let e = ended.clone();
+    assert_eq!(a.terminate(q, false, Some(Box::new(move || e.set()))), 0);
+    assert_eq!(a.status(&mut *b, true), E_ABORT, "a call whose scheduled work the terminating queue canceled");
+    assert!(ended.wait(5000), "termination did not finish");
+    assert!(until(2000, || ops[OP_CLEANUP as usize].load(SeqCst) == 1));
+    let seen: [u32; 5] = core::array::from_fn(|i| ops[i].load(SeqCst));
+    assert_eq!(seen, [1, 0, 0, 1, 1], "ops seen as [Begin, DoWork, GetResult, Cancel, Cleanup]");
+    a.close(q);
+}
+
+pub fn verify_status_of_a_block_never_started() {
+    let a = api();
+    let q = thread_pool_queue();
+    let mut b = Block::new(q);
+    let (mut size, mut used) = (7usize, 7usize);
+    let zeroed = (a.status(&mut *b, false), a.status(&mut *b, true), a.result_size(&mut *b, &mut size), size, a.result(&mut *b, 0, 0, core::ptr::null_mut(), &mut used), used);
+    let mut p = Block::new(q);
+    p.internal[8..12].copy_from_slice(&E_PENDING.to_le_bytes());
+    let pending = (a.status(&mut *p, false), a.status(&mut *p, true));
+    assert_eq!(
+        (zeroed, pending),
+        ((0, 0, 0, 0, 0, 0), (E_PENDING, E_INVALIDARG)),
+        "zeroed block: [status, status(wait), result size hr, size, result hr, used]; block whose status field reads E_PENDING: [status, status(wait)]"
+    );
+    a.close(q);
+}
+
+pub fn verify_result_errors_end_the_call() {
+    let a = api();
+    let q = thread_pool_queue();
+    let mut seen = Vec::new();
+    for case in 0..4 {
+        let f = Factorial::new(5, 0);
+        let mut b = Block::new(q);
+        assert_eq!(factorial_async(&f, &mut b, false), 0);
+        assert_eq!(a.status(&mut *b, true), 0);
+        let mut size = 0usize;
+        assert_eq!((a.result_size(&mut *b, &mut size), size), (0, 4));
+        let (mut v, mut used) = (0u32, 0usize);
+        let vp = &mut v as *mut u32 as *mut c_void;
+        let hr = match case {
+            0 => a.result(&mut *b, FACTORIAL_ID + 1, 4, vp, &mut used),
+            1 => a.result(&mut *b, 0, 4, vp, &mut used),
+            2 => a.result(&mut *b, FACTORIAL_ID, 4, core::ptr::null_mut(), &mut used),
+            _ => a.result(&mut *b, FACTORIAL_ID, 2, vp, &mut used),
+        };
+        let cleaned = until(2000, || f.ops().contains(&OP_CLEANUP));
+        let retry = factorial_result(&mut *b, &mut v);
+        let mut after = 9usize;
+        let size_hr = a.result_size(&mut *b, &mut after);
+        seen.push((hr, cleaned, retry, size_hr, after));
+    }
+    let failed = (E_ILLEGAL_METHOD_CALL, 0, 0);
+    let expected: Vec<(i32, bool, i32, i32, usize)> = [E_INVALIDARG, E_INVALIDARG, E_INVALIDARG, E_NOT_SUFFICIENT_BUFFER].iter().map(|hr| (*hr, true, failed.0, failed.1, failed.2)).collect();
+    assert_eq!(seen, expected, "per case (other identity, null identity, null buffer, short buffer): [hr, Cleanup ran, hr of a correct retry, result size hr, size]");
+
+    let case = begin_case(0, Completes::InDoWork);
+    let mut b = Block::new(q);
+    assert_eq!(a.begin(&mut *b, &case as *const _ as usize, 0x1234, begin_case_provider), 0);
+    assert_eq!(a.status(&mut *b, true), 0);
+    let mut used = 7usize;
+    let zero_payload = (a.result(&mut *b, 0x9999, 0, core::ptr::null_mut(), &mut used), used);
+    assert_eq!(zero_payload, (0, 0), "zero-payload call read with another identity: [hr, used]");
+    a.close(q);
+}
+
 
 macro_rules! xtq_tests {
     ($setup:path) => {
@@ -2234,7 +2560,8 @@ macro_rules! xtq_tests {
             verify_queue_monitor_has_correct_ports,
             verify_nested_queue_dispatch_order, verify_terminate_waits_for_async_in_flight,
             verify_single_queue_delayed_poll_strand, verify_composite_queue_delayed_callback_starvation,
-            verify_termination_cancels_delayed_callbacks, verify_close_keeps_queued_callbacks,
+            verify_termination_cancels_delayed_callbacks, verify_termination_order_on_a_manual_queue,
+            verify_close_keeps_queued_callbacks,
             verify_dispatch_on_pool_port, verify_thread_pool_callbacks_can_block,
             verify_serialized_queues_do_not_keep_threads, verify_serialized_port_final_release,
             verify_serialized_port_survives_one_release, verify_serialized_idle_port_delivers_termination,
@@ -2243,10 +2570,13 @@ macro_rules! xtq_tests {
             verify_cancellation, verify_cleanup_waits_for_work, verify_cleanup_waits_for_work_distributed,
             verify_run_async, verify_custom_queue, verify_cant_schedule_twice, verify_wait_for_completion,
             verify_periodic_pattern, verify_run_alot_async, verify_get_async_status_no_deadlock,
-            verify_failed_begin_completes, verify_pending_begin_stays_pending, verify_zero_payload_cleans_up_fast, verify_complete_in_begin,
+            verify_failed_begin_completes, verify_pending_begin_stays_pending, verify_failed_begin_reports_its_failure,
+            verify_cleanup_waits_for_the_callback_when_begin_completes, verify_zero_payload_cleans_up_fast, verify_complete_in_begin,
             verify_begin_after_terminate, verify_failure_in_do_work, verify_duplicate_result_calls_fail,
             verify_duplicate_pending_result_calls_succeed, verify_no_write_after_get_status_race,
-            verify_result_buffer_checks);
+            verify_result_buffer_checks, verify_cancel_leaves_completion_to_the_provider,
+            verify_canceled_work_cancels_the_provider, verify_status_of_a_block_never_started,
+            verify_result_errors_end_the_call);
     };
     (@ $setup:path; $($name:ident),* $(,)?) => {
         $(

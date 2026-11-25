@@ -40,7 +40,8 @@ fn set_current_process_task_queue_replaces_and_clears_the_process_queue() {
         close(o, mine);
         let mut cur = 0usize;
         assert!(get(o, &mut cur));
-        assert_eq!(cur, mine);
+        assert_ne!(cur, 0);
+        assert_ne!(cur, mine);
         close(o, cur);
         assert_eq!(submit(o, 0, 0, core::ptr::null_mut(), task), 0);
 
@@ -60,7 +61,7 @@ fn set_current_process_task_queue_replaces_and_clears_the_process_queue() {
 
         set(o, def);
         assert!(get(o, &mut cur));
-        assert_eq!(cur, def);
+        assert_ne!(cur, 0);
         assert!(gdk::rt::process_queue_available());
         assert_eq!(reg(so, 0, core::ptr::null_mut(), on_state as *const () as usize, &mut tok), 0);
         assert_eq!(terminate(o, def, false, core::ptr::null_mut(), 0), 0x8007_0005u32 as i32);

@@ -27,7 +27,7 @@ fn bypass_reason_from(vars: impl Iterator<Item = (String, String)>, disabled: Op
     if disabled.as_deref().map(str::trim) == Some("0") {
         return Some("TOMBOX_XLAT_INDEX=0".into());
     }
-    let knobs: Vec<String> = vars.map(|(k, _)| k).filter(|k| k.starts_with("TOMBOX_XS_") || k.starts_with("TOMBOX_CBRAW_") || k == "TOMBOX_INFER_ROOT_SIG").collect();
+    let knobs: Vec<String> = vars.map(|(k, _)| k).filter(|k| k.starts_with("TOMBOX_XS_") || k.starts_with("TOMBOX_CBRAW_") || k == "TOMBOX_INFER_ROOT_SIG" || k == "TOMBOX_FSSM_ROOT_SIG").collect();
     if knobs.is_empty() { None } else { Some(format!("translator debug knobs set ({})", knobs.join(", "))) }
 }
 
@@ -133,6 +133,7 @@ mod tests {
         assert!(bypass_reason_from(v("TOMBOX_XS_STUB"), None).is_some());
         assert!(bypass_reason_from(v("TOMBOX_XS_DROP"), None).is_some());
         assert!(bypass_reason_from(v("TOMBOX_INFER_ROOT_SIG"), None).is_some());
+        assert!(bypass_reason_from(v("TOMBOX_FSSM_ROOT_SIG"), None).is_some());
         assert!(bypass_reason_from(v("TOMBOX_CBRAW_CLAMP"), None).is_some());
         assert!(bypass_reason_from(v("TOMBOX_FRAME_CSV"), None).is_none());
         assert!(bypass_reason_from(v("TOMBOX_FRAME_CSV"), Some("0".into())).is_some());

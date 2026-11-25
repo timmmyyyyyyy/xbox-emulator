@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub const IOCTL_POWER_STATE: u32 = 0x15004c;
+pub const IOCTL_SFR_COUNTER_GROUP: u32 = 0x150064;
 pub const IOCTL_MODE_SFR_COUNTER: u32 = 0x150068;
 pub const IOCTL_PIX_STATE: u32 = 0x15006c;
 pub const IOCTL_SLOT_DEQUEUE: u32 = 0x150084;
@@ -77,7 +78,7 @@ unsafe fn rd64(p: *const u8, off: usize) -> u64 {
 }
 
 pub fn known(code: u32) -> bool {
-    matches!(code, IOCTL_POWER_STATE | IOCTL_MODE_SFR_COUNTER | IOCTL_PIX_STATE | IOCTL_SLOT_DEQUEUE | IOCTL_SLOT_UNMAP | IOCTL_SLOT_REGISTER | IOCTL_SLOT_UNREGISTER | IOCTL_AUDIO_FLAG | IOCTL_SFR_UPDATE | IOCTL_GAME_READY | IOCTL_PARTITION_INFO | IOCTL_TRANSFER_MEMORY | IOCTL_SFR_GET)
+    matches!(code, IOCTL_SFR_COUNTER_GROUP | IOCTL_POWER_STATE | IOCTL_MODE_SFR_COUNTER | IOCTL_PIX_STATE | IOCTL_SLOT_DEQUEUE | IOCTL_SLOT_UNMAP | IOCTL_SLOT_REGISTER | IOCTL_SLOT_UNREGISTER | IOCTL_AUDIO_FLAG | IOCTL_SFR_UPDATE | IOCTL_GAME_READY | IOCTL_PARTITION_INFO | IOCTL_TRANSFER_MEMORY | IOCTL_SFR_GET)
 }
 
 pub unsafe fn ioctl(code: u32, inb: *const u8, inl: u32, outb: *mut u8, outl: u32) -> (i32, usize) {
@@ -95,6 +96,16 @@ pub unsafe fn ioctl(code: u32, inb: *const u8, inl: u32, outb: *mut u8, outl: u3
                 s.audio = 0;
             }
             (STATUS_SUCCESS, 0)
+        }
+        IOCTL_SFR_COUNTER_GROUP if compat_common::os_host::routes::current_build() == 19041 => {
+            if outl < 33 || !outb_ok {
+                return (STATUS_INVALID_PARAMETER, 0);
+            }
+            for (i, counter) in (0x28..=0x2b).enumerate() {
+                outb.add(8 * i).cast::<u64>().write_unaligned(sfr(counter));
+            }
+            outb.add(32).write(0);
+            (STATUS_SUCCESS, 33)
         }
         IOCTL_MODE_SFR_COUNTER => {
             if outl < 8 || !outb_ok {

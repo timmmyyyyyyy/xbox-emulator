@@ -17,7 +17,9 @@ pub mod hlsl;
 #[cfg(windows)]
 pub mod dxc;
 pub mod meta;
+pub mod fssm_bind;
 pub mod dxil_meta;
+pub mod dxil_hash;
 pub mod decls;
 pub mod uearchive;
 pub mod rdna2;
@@ -28,6 +30,7 @@ pub mod gds_abi;
 pub mod global_abi;
 pub mod centroid_abi;
 pub mod user_data_abi;
+pub mod tess_abi;
 pub mod runtime_hlsl;
 pub mod cbv_raw_hlsl;
 #[cfg(windows)]
@@ -150,6 +153,7 @@ pub fn parse_root_signature(data: &[u8]) -> Result<meta::RootSig, String> {
 
 pub use hlsl::infer::infer_root_signature;
 pub use hlsl::translate_with_inference;
+pub use hlsl::{translate_with_fssm_root, translate_linked_with_fssm_root};
 
 /// Program type from the DXIL program header (D3D12_SHADER_VERSION_TYPE).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -80,6 +80,23 @@ fn pair() -> (ShaderExtract, ShaderExtract) {
 }
 
 #[test]
+fn integer_vertex_selectors_read_the_requested_vertex() {
+    let words = [0xc802_0002, 0xc806_0100, 0xc80a_0201, 0xc80e_0301, 0xf800_180f, 0x0302_0100, S_ENDPGM];
+    let ps = shader(
+        Stage::Pixel,
+        &words,
+        vec![sig("TEXCOORD", 0, 0, 1, 0, 0xf)],
+        vec![sig("SV_Target", 0, 64, 1, 0, 0xf)],
+    );
+    let t = translate(&ps).expect("PS");
+    assert!(t.hlsl.contains("TB_WV((uint)(i.i0.x), v0)"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("GetAttributeAtVertex(i.i0, 1).y"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("GetAttributeAtVertex(i.i0, 2).z"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("GetAttributeAtVertex(i.i0, 2).w"), "{}", t.hlsl);
+    assert_eq!(t.profile, "ps_6_2");
+}
+
+#[test]
 fn stage_feeding_a_pixel_shader_gets_its_interpolation_modifiers() {
     let (ps, vs) = pair();
     let ps_t = translate(&ps).expect("PS");

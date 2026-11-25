@@ -9,7 +9,7 @@ use tombox_xshader::{extract, parse_root_signature, Stage};
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: {} <shader.dxbc> [--root-signature f] [--hlsl-out f] [--isa-out f] [--fssm-out f]", args[0]);
+        eprintln!("usage: {} <shader.dxbc> [--root-signature f] [--hlsl-out f] [--isa-out f] [--fssm-out f] [--fssm-root 1]", args[0]);
         return ExitCode::FAILURE;
     }
     let path = &args[1];
@@ -17,6 +17,7 @@ fn main() -> ExitCode {
     let mut fssm_out = None;
     let mut hlsl_out = None;
     let mut root_signature = None;
+    let mut fssm_root = None;
     let mut i = 2;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -25,6 +26,7 @@ fn main() -> ExitCode {
             "--fssm-out" => &mut fssm_out,
             "--hlsl-out" => &mut hlsl_out,
             "--root-signature" => &mut root_signature,
+            "--fssm-root" => &mut fssm_root,
             _ => {
                 eprintln!("unknown option {flag}");
                 return ExitCode::FAILURE;
@@ -64,6 +66,12 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+    }
+
+    let fssm_root = fssm_root.is_some_and(|v| v.as_str() == "1");
+    if fssm_root {
+        ex.root_sig = None;
+        ex.has_root_sig = false;
     }
 
     let stage = match ex.stage {
@@ -111,6 +119,19 @@ fn main() -> ExitCode {
             println!("    param[{i}] vis={} {:?}", p.visibility, p.kind);
         }
     }
+    match tombox_xshader::fssm_bind::parse(&ex.fssm) {
+        Ok(None) => println!("  FSSM binding table: none"),
+        Err(e) => println!("  FSSM binding table: {e}"),
+        Ok(Some(b)) => {
+            println!("  FSSM binding table: hardware stage slot {:x?}, {} user SGPRs, resource heap {:?}, sampler heap {:?}, {} static samplers", b.hw_stage_slot, b.user_sgprs, b.resource_heap, b.sampler_heap, b.static_samplers.len());
+            for (i, p) in b.params.iter().enumerate() {
+                println!("    fssm param[{i}] slot {} {:?} ({} table entries)", p.slot, p.kind, p.table_entries.len());
+            }
+            for u in &b.uses {
+                println!("    fssm use {:?} {:?} param {} dword {} register {} stride {}", u.source, u.class, u.param, u.offset_dwords, u.register, u.stride);
+            }
+        }
+    }
     println!("--- RDNA2 disassembly ---");
     let insns = tombox_xshader::rdna2::disassemble(&ex.isa);
     let mut consumed = 0usize;
@@ -133,6 +154,10 @@ fn main() -> ExitCode {
         let aux = match ins.enc {
             tombox_xshader::rdna2::Enc::Exp => format!(" [target={} en={:#06b}]", ins.aux.imm, ins.aux.mask),
             tombox_xshader::rdna2::Enc::Vinterp => format!(" [attr{}.{}]", ins.aux.imm, ins.aux.imm2),
+            tombox_xshader::rdna2::Enc::Vop3 if matches!(ins.op, 0x200 | 0x201 | 0x202 | 0x342 | 0x343 | 0x35a) => {
+                let high = ins.raw.get(1).is_some_and(|d1| d1 & 0x100 != 0);
+                format!(" [attr{}.{}{}]", ins.aux.imm, ins.aux.imm2, if high { " high" } else { "" })
+            }
             tombox_xshader::rdna2::Enc::Smem => format!(" [off={:#x}]", ins.aux.imm),
             tombox_xshader::rdna2::Enc::Sopp | tombox_xshader::rdna2::Enc::Sopk => format!(" [imm={}]", ins.aux.imm),
             _ => String::new(),
@@ -175,7 +200,7 @@ fn main() -> ExitCode {
         }
     }
     if let Some(f) = hlsl_out {
-        match tombox_xshader::hlsl::translate(&ex) {
+        match if fssm_root { tombox_xshader::translate_with_fssm_root(&ex) } else { tombox_xshader::hlsl::translate(&ex) } {
             Ok(t) => {
                 if let Err(e) = std::fs::write(&f, &t.hlsl) {
                     eprintln!("cannot write {f}: {e}");

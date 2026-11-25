@@ -91,7 +91,7 @@ fn ms(words: &[u32], mi: MeshInfo, outs: Vec<SigElement>) -> ShaderExtract {
         output_sig: outs,
         prim_sig: Vec::new(),
         resources: Vec::new(),
-        gs_info: Some(GsInfo { input_primitive: 0, output_topology: 0, max_vertex_count: 0, mesh: Some(mi) }),
+        gs_info: Some(GsInfo { input_primitive: 0, output_topology: 0, max_vertex_count: 0, mesh: Some(mi), tess: None }),
         root_sig: None,
     }
 }
@@ -105,22 +105,29 @@ fn console_ms(nv: u32, np: u32, prim: u32) -> Vec<u32> {
 }
 
 fn console_ms_b(nv: u32, np: u32, prim: u32, div_barrier: bool) -> Vec<u32> {
+    ms_prog((np << 12) | nv, prim, div_barrier, false, &[], [2, 3])
+}
+
+fn ms_prog(m0: u32, prim: u32, div_barrier: bool, wave32: bool, pre: &[u32], tex: [u32; 2]) -> Vec<u32> {
     let mut w = vec![];
-    w.push(sop1(4, EXEC, ic(-1)));
+    w.push(sop1(if wave32 { 3 } else { 4 }, EXEC, ic(-1)));
     w.extend(vop3(0x365, 0, [ic(-1), ic(0), 0]));
-    w.extend(vop3(0x366, 0, [ic(-1), v(0), 0]));
+    if !wave32 {
+        w.extend(vop3(0x366, 0, [ic(-1), v(0), 0]));
+    }
+    w.extend_from_slice(pre);
     w.extend([sop2(0x27, 3, 3, LIT), 0x40018]);
-    w.extend(vop3(0x346, 0, [3, ic(6), v(0)]));
+    w.extend(vop3(0x346, 0, [3, ic(if wave32 { 5 } else { 6 }), v(0)]));
     w.push(vop1(2, 2, v(5)));
-    w.push(sop1(4, 10, EXEC));
+    w.push(sop1(if wave32 { 3 } else { 4 }, 10, EXEC));
     w.push(vopc(0xd2, ic(0), 0));
     w.push(sopp(8, 3 + div_barrier as u16));
-    w.extend([sop1(3, M0, LIT), (np << 12) | nv]);
+    w.extend([sop1(3, M0, LIT), m0]);
     w.push(sopp(0x10, 9));
     if div_barrier {
         w.push(sopp(0x0a, 0));
     }
-    w.push(sop1(4, EXEC, 10));
+    w.push(sop1(if wave32 { 3 } else { 4 }, EXEC, 10));
     w.push(sopp(0x0a, 0));
     w.extend([vop1(1, 2, LIT), 4.0f32.to_bits()]);
     w.extend([vopc(0xc2, LIT, 0), 65]);
@@ -129,8 +136,8 @@ fn console_ms_b(nv: u32, np: u32, prim: u32, div_barrier: bool) -> Vec<u32> {
     w.push(vop2(0x01, 3, F_NEG1, 2));
     w.push(vop1(1, 4, ic(0)));
     w.push(vop1(1, 6, F_ONE));
-    w.push(vop1(1, 7, 2));
-    w.push(vop1(1, 8, 3));
+    w.push(vop1(1, 7, tex[0]));
+    w.push(vop1(1, 8, tex[1]));
     w.extend([vop1(1, 9, LIT), prim]);
     w.extend(exp(12, 0xf, false, [1, 3, 4, 6]));
     w.extend(exp(20, 0x1, false, [9, 0, 0, 0]));
@@ -182,7 +189,9 @@ fn mesh_hlsl_entry_and_tail() {
         "[numthreads(128, 1, 1)]",
         "[outputtopology(\"triangle\")]",
         "out vertices SOut verts[128], out indices uint3 tris[128], out primitives SPrim prims[128]",
-        "v5 = gid.x * 128u + gi; s3 = (gi / 64u) << 24;",
+        "v5 = gid.x * 128u + gi;",
+        "s3 = 0x20000000u | ((gi / 64u) << 24) | (min(64u, 128u - (gi & 0xffffffc0u)) * 0x101u);",
+        "uint tb_nv = tb_mscnt & 0x3ffu, tb_np = (tb_mscnt >> 12) & 0x7ffu;",
         "s2 = (gid.x * 128u + (gi & 0xffffffc0u));",
         "(min(gi & 63u, 32u) + 0x0u)",
         "(max(gi & 63u, 32u) - 32u + v0)",
@@ -326,6 +335,30 @@ fn mesh_typed_buffer_load_uses_root_table_range() {
     let translated = translate(&shader).expect("explicit SRV descriptor range");
     assert!(translated.hlsl.contains("Buffer<"), "{}", translated.hlsl);
     assert!(translated.hlsl.contains("register(t7, space2)"), "{}", translated.hlsl);
+}
+
+#[test]
+fn mesh_fssm_table_slots_follow_the_eight_system_sgprs() {
+    let mut words = vec![0xf408_0008, 0xfa00_0020, 0xe000_2000, 0x8000_0101];
+    words.extend(console_ms(3, 1, 0));
+    let mut shader = ms(&words, mesh_info(128, 128, 128, 2), pos_param_outs());
+    let mut f = vec![0u8; 0x100];
+    f[0..4].copy_from_slice(b"FSSM");
+    f[0xD6] = 9;
+    f[0x58..0x60].copy_from_slice(&0xB0u64.to_le_bytes());
+    f[0xE8..0xF0].copy_from_slice(&0xF0u64.to_le_bytes());
+    f[0xF0..0xF8].copy_from_slice(&0x104u64.to_le_bytes());
+    f[0xF8..0xFC].copy_from_slice(&1u32.to_le_bytes());
+    f[0xFC..0x100].copy_from_slice(&1u32.to_le_bytes());
+    for w in [3u32, 0, 1, 0, 8, 0x300, 8, 7, 4, 0x0804] {
+        f.extend_from_slice(&w.to_le_bytes());
+    }
+    shader.fssm = f;
+    assert!(translate(&shader).is_err());
+    let translated = tombox_xshader::translate_with_fssm_root(&shader).unwrap_or_else(|e| panic!("FSSM table translation failed: {e}"));
+    assert!(translated.hlsl.contains("Buffer<"), "{}", translated.hlsl);
+    assert!(translated.hlsl.contains("register(t7)"), "{}", translated.hlsl);
+    assert!(dxc::compile(&translated.hlsl, &dxc::profile_for(translated.profile)).is_ok());
 }
 
 #[test]
@@ -576,7 +609,11 @@ fn bytecode(b: &[u8]) -> Vec<u8> {
 static WARP_RENDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 unsafe fn render(words: &[u32], groups: u32) -> Result<[u32; 4], String> {
-    let t = translate(&ms(words, mesh_info(128, 128, 128, 2), pos_param_outs()))?;
+    render_mi(words, groups, mesh_info(128, 128, 128, 2))
+}
+
+unsafe fn render_mi(words: &[u32], groups: u32, mi: MeshInfo) -> Result<[u32; 4], String> {
+    let t = translate(&ms(words, mi, pos_param_outs()))?;
     let msb = dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).map_err(|e| format!("{e}\n{}", t.hlsl))?;
     let psb = dxc::compile(PS, "ps_6_5")?;
     let _warp = std::env::var_os("TOMBOX_EXEC_HW").is_none().then(|| WARP_RENDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -784,6 +821,47 @@ fn mesh_alloc_and_lds_refusals() {
 }
 
 #[test]
+fn mesh_export_and_entry_count_refusals_are_explicit() {
+    let base = console_ms(3, 1, 0);
+    let with = |extra: [u32; 2]| {
+        let mut w = base.clone();
+        w.extend(extra);
+        w
+    };
+    let e = translate(&ms(&with(exp(21, 0x1, false, [0, 0, 0, 0])), mesh_info(128, 128, 128, 2), pos_param_outs())).err().expect("refusal");
+    assert!(e.contains("mesh export target 21 unsupported"), "{e}");
+    let e = translate(&ms(&with(exp(13, 0x1, false, [0, 0, 0, 0])), mesh_info(128, 128, 128, 2), pos_param_outs())).err().expect("refusal");
+    assert!(e.contains("position export 13.x has no clip/cull distance element"), "{e}");
+    let layer = vec![sig("SV_Position", 1, 3, 0, 0xf), sig("SV_ViewportArrayIndex", 5, 1, 1, 0x1)];
+    let e = translate(&ms(&with(exp(13, 0x1, false, [0, 0, 0, 0])), mesh_info(128, 128, 128, 2), layer)).err().expect("refusal");
+    assert!(e.contains("position-export misc vector unsupported"), "{e}");
+    let clip = vec![sig("SV_Position", 1, 3, 0, 0xf), sig("SV_ClipDistance", 2, 3, 1, 0x3)];
+    let t = translate(&ms(&with(exp(13, 0x3, false, [0, 0, 0, 1])), mesh_info(128, 128, 128, 2), clip)).expect("clip-distance export 13");
+    assert!(t.hlsl.contains("o.o1"), "{}", t.hlsl);
+    let e = translate(&ms(&base, mesh_info(128, 0, 1, 2), pos_param_outs())).err().expect("refusal");
+    assert!(e.contains("mesh shader with max vertices 0 / primitives 1"), "{e}");
+    let mut mi = mesh_info(128, 128, 128, 2);
+    mi.prim_vectors = 1;
+    let mut ex = ms(&base, mi, pos_param_outs());
+    ex.prim_sig = vec![sig("SV_PrimitiveID", 8, 1, 0, 0x1)];
+    let e = translate(&ex).err().expect("refusal");
+    assert!(e.contains("per-primitive system values unsupported"), "{e}");
+    let mut w = base.clone();
+    let end = w.len() - 1;
+    w.splice(end..end, [0xd834_0000, 0x0000_0100]);
+    let e = translate(&ms(&w, mesh_info(192, 3, 1, 2), pos_param_outs())).err().expect("refusal");
+    assert!(e.contains("mesh shader with 192 threads and LDS unsupported"), "{e}");
+    let mut w = base.clone();
+    let end = w.len() - 1;
+    w.splice(end..end, [0xd834_ffff, 0x0000_0100]);
+    let e = translate(&ms(&w, mesh_info(128, 3, 1, 2), pos_param_outs())).err().expect("refusal");
+    assert!(e.contains("LDS offset 65551 beyond the PC groupshared limit"), "{e}");
+    let bare = vec![sop1(3, M0, LIT), 0x40018, sopp(0x10, 9), S_ENDPGM];
+    let e = translate(&ms(&bare, mesh_info(128, 3, 1, 2), Vec::new())).err().expect("refusal");
+    assert!(e.contains("mesh shader without vertex outputs"), "{e}");
+}
+
+#[test]
 fn mesh_divergent_barrier_with_memory_store_is_refused() {
     let mut w = console_ms_b(67, 1, TRI, true);
     let end = w.len() - 1;
@@ -803,6 +881,31 @@ fn gpu_mesh_culled_and_empty_outputs_draw_nothing() {
     assert_eq!(empty, clear);
     let one = unsafe { render(&console_ms(67, 1, TRI), 1) }.unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(one, [64, 1, 0x77, 0x88]);
+}
+
+#[test]
+fn gpu_mesh_merged_wave_info_fields() {
+    let pre = [sop2(0x27, 4, 3, LIT), 0x4001c, sop2(0x0e, 5, 3, LIT), 0xffff];
+    for (wave32, threads, counts, tg) in [(false, 128, 0x4040, 2), (true, 128, 0x2020, 4), (false, 96, 0x2020, 2), (true, 80, 0x1010, 3), (false, 256, 0x4040, 4), (true, 256, 0x2020, 8)] {
+        let w = ms_prog((1 << 12) | 67, TRI, false, wave32, &pre, [5, 4]);
+        let mi = mesh_info(threads, threads as u16, threads as u16, 2);
+        let t = translate(&ms(&w, mi, pos_param_outs())).expect("translate");
+        let ws = if wave32 { 32 } else { 64 };
+        let gi = if threads > 128 { "tb_gi" } else { "gi" };
+        let want = format!("s3 = {:#x}u | (({gi} / {ws}u) << 24) | (min({ws}u, {threads}u - ({gi} & {:#x}u)) * 0x101u);", tg << 28, !(ws - 1u32));
+        assert!(t.hlsl.contains(&want), "missing `{want}` in\n{}", t.hlsl);
+        let got = unsafe { render_mi(&w, 2, mi) }.unwrap_or_else(|e| panic!("wave{ws} x {threads}: {e}"));
+        assert_eq!(got, [counts, tg, 0x77, 0x88], "wave{ws} x {threads}");
+    }
+}
+
+#[test]
+fn gpu_mesh_alloc_req_counts_at_limit_ignore_bits_outside_fields() {
+    let w = ms_prog(0xff80_0800 | (128 << 12) | 128, TRI, false, false, &[], [2, 3]);
+    let t = translate(&ms(&w, mesh_info(128, 128, 128, 2), pos_param_outs())).expect("translate");
+    assert!(t.hlsl.contains("uint tb_nv = tb_mscnt & 0x3ffu, tb_np = (tb_mscnt >> 12) & 0x7ffu;"), "{}", t.hlsl);
+    let got = unsafe { render(&w, 3) }.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(got, [2 * 128 + 64, 1, 0x77, 0x88]);
 }
 
 fn rts0_blob(flags: u32) -> Vec<u8> {

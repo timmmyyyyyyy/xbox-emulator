@@ -876,10 +876,13 @@ unsafe fn apply_pso_bias(list: *mut c_void, pso: usize) {
 
 unsafe extern "system" fn w_pso(this: *mut c_void, pso: *mut c_void) {
     let graphics = pso_bias(pso as usize).is_some();
+    let stream_graphics = !graphics && crate::dbcount::stream_rec(pso as usize).is_some_and(|r| r.is_graphics());
     rec(this, |s| {
         s.pso = Some(pso as usize);
-        if graphics {
+        if graphics || stream_graphics {
             s.variant_bound = false;
+        }
+        if graphics {
             s.depth_bias_x = None;
         }
     });
@@ -914,15 +917,52 @@ unsafe fn apply_rect(list: *mut c_void) {
     if pso == 0 {
         return;
     }
-    let Some(k) = (unsafe { wanted_key(list, pso) }) else {
-        crate::rectlist::refuse(0, pso as u64, &format!("PSO {pso:#x} has no recorded PC description (stream-built or unknown pipeline)"));
-        return;
+    let v = match unsafe { wanted_key(list, pso) } {
+        Some(k) => unsafe { pso_variant(pso, k) },
+        None => match crate::dbcount::stream_rec(pso) {
+            Some(r) if r.is_graphics() => unsafe { stream_rect_variant(list, pso, &r) },
+            Some(_) => 0,
+            None if crate::device_x::is_compute(pso) || crate::pso_async::is_compute_placeholder(pso) => 0,
+            None => {
+                crate::rectlist::refuse(0, pso as u64, &format!("PSO {pso:#x} has no recorded PC description or pipeline stream (unknown pipeline)"));
+                0
+            }
+        },
     };
-    let v = unsafe { pso_variant(pso, k) };
     if v != 0 {
         unsafe { pc_set_pso(list, v) };
         with(list, |s| s.variant_bound = true);
     }
+}
+
+struct StreamVariant {
+    id: usize,
+    pso: usize,
+    _keep: Option<Box<dyn Send + Sync>>,
+}
+
+static STREAM_RECT: Mutex<Option<HashMap<usize, StreamVariant>>> = Mutex::new(None);
+
+unsafe fn stream_rect_variant(list: *mut c_void, pso: usize, r: &std::sync::Arc<crate::dbcount::StreamRec>) -> usize {
+    let id = std::sync::Arc::as_ptr(r) as usize;
+    let mut g = STREAM_RECT.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some(v) = m.get(&pso).filter(|v| v.id == id) {
+        return v.pso;
+    }
+    let v = match crate::rectlist::expand_stream(&r.stream, &r.subs) {
+        None => StreamVariant { id, pso: 0, _keep: None },
+        Some((s, subs, gs)) => match unsafe { crate::dbcount::create_stream_pso(list, &s) } {
+            Ok(p) => StreamVariant { id, pso: p, _keep: Some(Box::new((s, gs, r.clone()))) },
+            Err(e) => {
+                crate::rectlist::refuse_stream(&s, &subs, &format!("the expanded pipeline stream of PSO {pso:#x} was refused by the driver ({e})"));
+                StreamVariant { id, pso: 0, _keep: None }
+            }
+        },
+    };
+    let p = v.pso;
+    m.insert(pso, v);
+    p
 }
 
 unsafe fn apply_depth_bias_x(this: *mut c_void, x: DepthBiasX) {
@@ -1303,9 +1343,11 @@ pub(crate) unsafe fn bound_variant_key(list: *mut c_void) -> Option<VariantKey> 
     if !bound {
         return None;
     }
-    let pb = pso_bias(pso)?;
-    let dynamic = pb.dynamic && unsafe { dynamic_usable(list) };
     let rect = is_rect(list);
+    let Some(pb) = pso_bias(pso) else {
+        return (rect && crate::dbcount::stream_rec(pso).is_some()).then_some(VariantKey { clip: false, dynamic: false, bias: None, rect: true });
+    };
+    let dynamic = pb.dynamic && unsafe { dynamic_usable(list) };
     Some(match x {
         Some(x) if !dynamic => VariantKey { rect, ..static_key(x) },
         Some(x) => VariantKey { clip: x.clip, dynamic: true, bias: None, rect },

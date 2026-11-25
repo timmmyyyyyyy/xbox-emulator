@@ -24,6 +24,7 @@ fn idle(s: &Singleton) {
 fn pix_dll_initialize_without_a_tool_follows_the_22000_console() {
     let dir = setup();
     assert!(bind_xbtp(XbtpFns {
+        session_io: || panic!("22000 must close an accepted link before resolving session I/O"),
         init_system: xbtp::link::XbtpLinkInitializeSystem,
         create: xbtp::link::XbtpLinkCreateHandle,
         listen: unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(*mut u8, *mut c_void, u16, *mut usize) -> i32>(xbtp::link::XbtpLinkListen as *const () as usize) },

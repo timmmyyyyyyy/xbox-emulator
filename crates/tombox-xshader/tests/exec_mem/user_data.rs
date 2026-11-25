@@ -45,7 +45,7 @@ unsafe fn cbv_root(g: &Gpu) -> Result<*mut c_void, String> {
     Ok(rs)
 }
 
-fn draw_user_data(words: &[u32], ud: &UserData) -> Result<[u32; 4], String> {
+pub(super) fn draw_user_data(words: &[u32], ud: &UserData) -> Result<[u32; 4], String> {
     let t = translate_user_data(&shader(words))?;
     if t.user_data_base.is_none() || !t.hlsl.contains("TbUserData") {
         return Err(format!("user-data fallback not selected\n{}", t.hlsl));

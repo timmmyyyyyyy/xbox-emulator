@@ -512,3 +512,84 @@ fn vopc_u64() {
 fn vopc_class_f16() {
     class_group().run_both("vopc_class_f16");
 }
+
+fn class32(b: u32) -> u32 {
+    let (e, m, neg) = ((b >> 23) & 0xff, b & 0x7f_ffff, b >> 31 != 0);
+    match (e, m) {
+        (0xff, 0) => if neg { 2 } else { 9 },
+        (0xff, _) => (m >> 22) & 1,
+        (0, 0) => if neg { 5 } else { 6 },
+        (0, _) => if neg { 4 } else { 7 },
+        _ => if neg { 3 } else { 8 },
+    }
+}
+
+fn class32_group() -> Cases {
+    let mut c = Cases::new();
+    let mn = |x: bool| if x { "v_cmpx_class_f32" } else { "v_cmp_class_f32" };
+    let op = |x: bool| if x { 0x98 } else { 0x88 };
+    let vals: [u32; 16] = [
+        0x7f80_0001, 0x7fc0_0000, 0xff80_0000, 0xc000_0000, 0x8000_0001, 0x8000_0000, 0, 0x007f_ffff, 0x3f80_0000, 0x7f80_0000, 0xffbf_ffff, 0xffc0_0000, 0x7f7f_ffff, 0x0080_0000, 0x7fff_ffff,
+        0x807f_ffff,
+    ];
+    let pass = |b: u32, mask: u32| (mask >> class32(b)) & 1;
+    for (k, &b) in vals.iter().enumerate() {
+        let bit = 1 << class32(b);
+        for mask in [bit, 0x3ff & !bit, if k % 2 == 0 { 0x155 } else { 0x2aa }, bit | 0xa5a5_0000, 0, 0x3ff] {
+            let r = pass(b, mask);
+            let mut pre = pr();
+            pre.vv(1, b).vv(2, mask).sv(106, SENT);
+            let mut post = pr();
+            post.vcc_to_v(0);
+            c.add(mn(false), &pre, &[vopc(op(false), v(1), 2)], &post, &[r]);
+            pre.vv(10, 0x1234);
+            c.add(mn(true), &pre, &[vopc(op(true), v(1), 2), vop1(1, 10, ic(7))], &post_cmpx(), &[if r != 0 { 7 } else { 0x1234 }, r, SENT]);
+        }
+        for (abs, neg) in [(1u32, 0u32), (0, 1), (1, 1)] {
+            let x = if abs != 0 { b & 0x7fff_ffff } else { b };
+            let x = if neg != 0 { x ^ 0x8000_0000 } else { x };
+            let mask = 1 << class32(x) | if k % 2 == 0 { 0x0f0 } else { 0x00f };
+            let mask = if k % 3 == 0 { mask & !(1 << class32(x)) } else { mask };
+            let r = pass(x, mask);
+            let mut pre = pr();
+            pre.vv(1, b).vv(2, mask).sv(20, 0xdead_beef).sv(106, SENT);
+            let mut post = pr();
+            post.s2v(0, 20).s2v(1, 106);
+            c.add(mn(false), &pre, &vop3m(op(false), 20, [v(1), v(2), 0], abs, neg, 0, false), &post, &[r, SENT]);
+            pre.vv(10, 0x1234);
+            let mut w = vop3m(op(true), 126, [v(1), v(2), 0], abs, neg, 0, false).to_vec();
+            w.push(vop1(1, 10, ic(7)));
+            c.add(mn(true), &pre, &w, &post_cmpx(), &[if r != 0 { 7 } else { 0x1234 }, r, SENT]);
+        }
+    }
+    for (src, bits) in [(240u32, 0x3f00_0000u32), (241, 0xbf00_0000), (242, 0x3f80_0000), (243, 0xbf80_0000), (246, 0x4080_0000), (248, 0x3e22_f983), (ic(0), 0), (ic(-1), 0xffff_ffff), (ic(5), 5), (ic(-16), 0xffff_fff0)] {
+        for mask in [1 << class32(bits), 0x3ff & !(1 << class32(bits))] {
+            let r = pass(bits, mask);
+            let mut pre = pr();
+            pre.vv(2, mask).sv(106, SENT);
+            let mut post = pr();
+            post.vcc_to_v(0);
+            c.add(mn(false), &pre, &[vopc(op(false), src, 2)], &post, &[r]);
+        }
+    }
+    for (bits, mask) in [(0x7f80_0001u32, 0x3ffu32), (0x3f80_0000, 0x100), (0xc2f6_e979, 0x008)] {
+        let r = pass(bits, mask);
+        let mut pre = pr();
+        pre.vv(2, mask).sv(106, SENT);
+        let mut post = pr();
+        post.vcc_to_v(0);
+        c.add(mn(false), &pre, &[vopc(op(false), LIT, 2), bits], &post, &[r]);
+    }
+    let mut pre = pr();
+    pre.vv(1, 0x3f80_0000).vv(2, 0x3ff).sv(106, SENT).vv(10, 0x1234).raw(&[sop1(3, 126, ic(0))]);
+    let mut post = pr();
+    post.raw(&[sop1(3, 126, ic(1))]).vcc_to_v(0);
+    c.add(mn(false), &pre, &[vopc(op(false), v(1), 2)], &post, &[0]);
+    c.add(mn(true), &pre, &[vopc(op(true), v(1), 2), vop1(1, 10, ic(7))], &post_cmpx(), &[0x1234, 0, SENT]);
+    c
+}
+
+#[test]
+fn vopc_class_f32() {
+    class32_group().run_both("vopc_class_f32");
+}

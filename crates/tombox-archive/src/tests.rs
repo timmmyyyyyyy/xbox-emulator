@@ -159,6 +159,49 @@ fn blocks_symlink_entry() {
 }
 
 #[test]
+fn blocks_duplicate_entries() {
+    let inv = inspect(
+        &assemble(&[
+            cd_header("Game/Content/pakchunk0.pak", 1, 1, 0, 0, &[]),
+            cd_header("game/content/PAKCHUNK0.PAK", 1, 1, 0, 0, &[]),
+        ]),
+        "duplicate",
+    );
+    let r = validate(&inv, 1000.0);
+    assert!(!r.is_safe_to_extract());
+    assert!(r.findings.iter().any(|f| f.issue.contains("collides")));
+}
+
+#[test]
+fn blocks_file_and_directory_with_the_same_name() {
+    let inv = inspect(
+        &assemble(&[
+            cd_header("Game/Content", 1, 1, 0, 0, &[]),
+            cd_header("game/content/", 0, 0, 0, 0, &[]),
+        ]),
+        "duplicate-file-dir",
+    );
+    let r = validate(&inv, 1000.0);
+    assert!(!r.is_safe_to_extract());
+    assert!(r.findings.iter().any(|f| f.issue.contains("collides")));
+}
+
+#[test]
+fn allows_distinct_names_and_repeated_directories() {
+    let inv = inspect(
+        &assemble(&[
+            cd_header("Game/Content/a.pak", 1, 1, 0, 0, &[]),
+            cd_header("Game/Content/b.pak", 1, 1, 0, 0, &[]),
+            cd_header("Game/", 0, 0, 0, 0, &[]),
+            cd_header("game/", 0, 0, 0, 0, &[]),
+        ]),
+        "distinct",
+    );
+    let r = validate(&inv, 1000.0);
+    assert!(r.is_safe_to_extract());
+}
+
+#[test]
 fn warns_on_bomb_ratio() {
     // 20 MiB uncompressed from 1000 bytes => ratio 20971x, over threshold.
     let h = cd_header("bomb.bin", 1000, 20 * 1024 * 1024, 0, 0, &[]);
@@ -231,7 +274,7 @@ fn accepts_eocd_with_comment() {
     assert_eq!(inv.entries[0].name, "ok.txt");
 }
 
-fn zip64_eocd(cd_offset: u64, cd_size: u64) -> Vec<u8> {
+fn zip64_eocd(cd_offset: u64, cd_size: u64, comment: &[u8]) -> Vec<u8> {
     let mut z = Vec::new();
     z.extend_from_slice(&SIG_EOCD64.to_le_bytes());
     z.extend_from_slice(&44u64.to_le_bytes()); // size of the remaining record
@@ -247,13 +290,25 @@ fn zip64_eocd(cd_offset: u64, cd_size: u64) -> Vec<u8> {
     z.extend_from_slice(&0u32.to_le_bytes()); // disk with ZIP64 EOCD
     z.extend_from_slice(&0u64.to_le_bytes()); // offset of ZIP64 EOCD (0)
     z.extend_from_slice(&1u32.to_le_bytes()); // total disks
-    z.extend_from_slice(&eocd(0xFFFF, 0xFFFF_FFFF, 0xFFFF_FFFF));
+    z.extend_from_slice(&eocd_with_comment(u16::MAX, u32::MAX, u32::MAX, comment));
     z
 }
 
 #[test]
+fn accepts_zip64_with_long_archive_comments() {
+    for comment_len in [u16::MAX - 20, u16::MAX - 19, u16::MAX] {
+        let comment = vec![b'a'; usize::from(comment_len)];
+        let bytes = zip64_eocd(0, 0, &comment);
+        let inv = inspect(&bytes, &format!("zip64-comment-{comment_len}"));
+        assert!(inv.zip64);
+        assert_eq!(inv.entry_count, 0);
+        assert!(inv.entries.is_empty());
+    }
+}
+
+#[test]
 fn rejects_zip64_cd_bounds_overflow() {
-    let bytes = zip64_eocd(0xFFFF_FFFF_FFFF_FFF8, 16);
+    let bytes = zip64_eocd(0xFFFF_FFFF_FFFF_FFF8, 16, b"");
     let p = temp_zip(&bytes, "zip64-overflow");
     let res = read_inventory(&p);
     let _ = std::fs::remove_file(&p);
@@ -266,7 +321,7 @@ fn rejects_zip64_cd_bounds_overflow() {
 
 #[test]
 fn rejects_zip64_eocd_past_eof() {
-    let mut bytes = zip64_eocd(0, 0);
+    let mut bytes = zip64_eocd(0, 0, b"");
     bytes[64..72].copy_from_slice(&u64::MAX.to_le_bytes());
     let p = temp_zip(&bytes, "zip64-past-eof");
     let res = read_inventory(&p);

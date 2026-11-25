@@ -519,3 +519,45 @@ fn fixed_result_exports_match_every_console_xcrdapi() {
         assert!(seen.get(name).copied().unwrap_or(0) >= 3, "{name} compared against {:?} console dumps", seen.get(name));
     }
 }
+
+#[test]
+fn newer_queue_iid_reaches_the_same_queue_and_factory_slot_10_creates_queues() {
+    let f = factory();
+    unsafe {
+        let cq1: unsafe extern "system" fn(*mut c_void, *const u8, *const c_void, *mut *mut c_void) -> i32 = core::mem::transmute(slot(f, 10));
+        let name = b"title streaming\0";
+        let mut d = [0u8; 0x20];
+        d[0..8].copy_from_slice(&(QUEUE_SOURCE_MEMORY as u64).to_le_bytes());
+        d[8..10].copy_from_slice(&0x40u16.to_le_bytes());
+        d[10] = PRIORITY_REALTIME as u8;
+        d[0x10..0x18].copy_from_slice(&(name.as_ptr() as u64).to_le_bytes());
+        d[0x18..0x20].copy_from_slice(&1u64.to_le_bytes());
+        let mut q: *mut c_void = core::ptr::null_mut();
+        assert_eq!(cq1(f, d.as_ptr(), IID_QUEUE_X1.as_ptr() as *const c_void, &mut q), S_OK);
+        assert!(!q.is_null());
+        let qi: unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32 = core::mem::transmute(slot(q, 0));
+        for iid in [IID_QUEUE_X, IID_QUEUE_X1, IID_IUNKNOWN] {
+            let mut other: *mut c_void = core::ptr::null_mut();
+            assert_eq!(qi(q, iid.as_ptr() as *const c_void, &mut other), S_OK);
+            assert_eq!(other, q);
+            release(other);
+        }
+        let mut info = [0u8; XQUEUE_INFO_SIZE];
+        let query: unsafe extern "system" fn(*mut c_void, *mut u8) = core::mem::transmute(slot(q, 11));
+        query(q, info.as_mut_ptr());
+        assert_eq!(&info[..XQUEUE_DESC_SIZE], &d[..XQUEUE_DESC_SIZE]);
+        assert_eq!(release(q), 0);
+
+        let mut none: *mut c_void = 1usize as *mut c_void;
+        d[10] = 0;
+        assert_eq!(cq1(f, d.as_ptr(), IID_QUEUE_X1.as_ptr() as *const c_void, &mut none), E_DSTORAGE_INVALID_MEMORY_QUEUE_PRIORITY);
+        assert!(none.is_null());
+        assert_eq!(cq1(f, core::ptr::null(), IID_QUEUE_X1.as_ptr() as *const c_void, &mut none), E_INVALIDARG);
+        assert_eq!(cq1(f, d.as_ptr(), IID_QUEUE_X1.as_ptr() as *const c_void, core::ptr::null_mut()), E_POINTER);
+        let mut file_d = [0u8; 0x20];
+        file_d[8..10].copy_from_slice(&0x80u16.to_le_bytes());
+        let mut fq: *mut c_void = core::ptr::null_mut();
+        assert_eq!(cq1(f, file_d.as_ptr(), IID_QUEUE_X.as_ptr() as *const c_void, &mut fq), S_OK);
+        assert_eq!(release(fq), 0);
+    }
+}

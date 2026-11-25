@@ -206,16 +206,17 @@ impl<'a> Emitter<'a> {
         } else {
             let _ = writeln!(h, "struct TbPayload {{ uint w[{n}]; }};");
             let _ = writeln!(h, "groupshared TbPayload tb_pl;");
+            let _ = writeln!(h, "groupshared uint tb_payload_ring[{n}];");
             let _ = writeln!(h, "groupshared uint tb_args[4];");
             let _ = writeln!(h, "static uint tb_gidx;");
             let _ = writeln!(
                 h,
                 "int tb_ring(uint2 va) {{ uint b = tb_gidx * {stride}u; if (va.y == {PAY_HI:#x}u && va.x >= b && va.x - b < {stride}u) return int((va.x - b) >> 2); b = tb_gidx * 16u; if (va.y == {ARGS_HI:#x}u && va.x >= b && va.x - b < 16u) return -1 - int((va.x - b) >> 2); return -1000; }}"
             );
-            let _ = writeln!(h, "uint tb_ring_get(int k) {{ return k >= 0 ? tb_pl.w[k] : tb_args[-1 - k]; }}");
+            let _ = writeln!(h, "uint tb_ring_get(int k) {{ return k >= 0 ? tb_payload_ring[k] : tb_args[-1 - k]; }}");
             let _ = writeln!(
                 h,
-                "void tb_ring_put(int k, uint v, uint m) {{ if (m == 0xffffffffu) {{ if (k >= 0) tb_pl.w[k] = v; else tb_args[-1 - k] = v; return; }} uint o; if (k >= 0) {{ InterlockedAnd(tb_pl.w[k], ~m, o); InterlockedOr(tb_pl.w[k], v & m, o); }} else {{ InterlockedAnd(tb_args[-1 - k], ~m, o); InterlockedOr(tb_args[-1 - k], v & m, o); }} }}"
+                "void tb_ring_put(int k, uint v, uint m) {{ if (m == 0xffffffffu) {{ if (k >= 0) tb_payload_ring[k] = v; else tb_args[-1 - k] = v; return; }} uint o; if (k >= 0) {{ InterlockedAnd(tb_payload_ring[k], ~m, o); InterlockedOr(tb_payload_ring[k], v & m, o); }} else {{ InterlockedAnd(tb_args[-1 - k], ~m, o); InterlockedOr(tb_args[-1 - k], v & m, o); }} }}"
             );
         }
         h.push_str(&VA_HELPERS.replace("TB_GLOBAL_SPACE", &GLOBAL_SPACE.to_string()));
@@ -263,11 +264,12 @@ impl<'a> Emitter<'a> {
         let _ = writeln!(h, "    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;");
         let _ = writeln!(h, "    s2 = {:#x}u; s3 = {:#x}u; s4 = gid.x; tb_gidx = gid.x;", ARGS_HI << 24, PAY_HI << 24);
         let _ = writeln!(h, "    for (uint tb_k = gi; tb_k < 4u; tb_k += {threads}u) tb_args[tb_k] = 0u;");
-        let _ = writeln!(h, "    for (uint tb_k = gi; tb_k < {n}u; tb_k += {threads}u) tb_pl.w[tb_k] = 0u;");
+        let _ = writeln!(h, "    for (uint tb_k = gi; tb_k < {n}u; tb_k += {threads}u) tb_payload_ring[tb_k] = 0u;");
         let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
         h.push_str(&self.body);
         let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
-        let _ = writeln!(h, "    DispatchMesh(tb_args[0], max(tb_args[1], 1u), max(tb_args[2], 1u), tb_pl);");
+        let _ = writeln!(h, "    for (uint tb_k = gi; tb_k < {n}u; tb_k += {threads}u) tb_pl.w[tb_k] = tb_payload_ring[tb_k];");
+        let _ = writeln!(h, "    DispatchMesh(tb_args[0], max(tb_args[1], 1u), 1u, tb_pl);");
         h.push_str("}\n");
         Ok(h)
     }

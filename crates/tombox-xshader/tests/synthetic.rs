@@ -5,7 +5,7 @@
 //! wrapped in a `ShaderExtract` with a made-up signature.
 
 use tombox_xshader::hlsl::translate;
-use tombox_xshader::meta::{GsInfo, MeshInfo, PsvResource, RootParam, RootParamKind, RootRange, RootSig, SigElement};
+use tombox_xshader::meta::{GsInfo, MeshInfo, PsvResource, RootParam, RootParamKind, RootRange, RootSig, SigElement, StaticSampler};
 use tombox_xshader::{parse_root_signature, ShaderExtract, Stage};
 
 const S_ENDPGM: u32 = 0xbf81_0000;
@@ -78,6 +78,7 @@ fn external_root_signature_binds_a_stripped_mesh_shader() {
             topology: 2,
             num_threads: [32, 1, 1],
         }),
+        tess: None,
     });
     let Err(error) = translate(&ex) else {
         panic!("translation unexpectedly accepted the missing root descriptor");
@@ -420,6 +421,99 @@ fn vertex_shader_receives_vertex_and_instance_index_in_v0_and_v3() {
     assert!(t.hlsl.contains("    v4 = asuint(i.i0.x);"), "{}", t.hlsl);
 }
 
+fn vintrp_word(op: u32, vdst: u32, attr: u32, chan: u32, vsrc: u32) -> u32 {
+    0xc800_0000 | (vdst << 18) | (op << 16) | (attr << 10) | (chan << 8) | vsrc
+}
+
+fn vop3_interp_words(op: u32, vdst: u32, attr: u32, chan: u32, vsrc: u32) -> [u32; 2] {
+    [0xd400_0000 | ((0x200 + op) << 16) | vdst, attr | (chan << 6) | ((256 + vsrc) << 9)]
+}
+
+fn interp_signature() -> (Vec<SigElement>, Vec<SigElement>) {
+    let mut pos = sig("SV_Position", 1, 3, 0, 0xf);
+    pos.rw_mask = 3;
+    let mut tex = sig("TEXCOORD", 0, 3, 1, 0xf);
+    tex.rw_mask = 0xf;
+    (vec![pos, tex], vec![sig("SV_Target", 64, 3, 0, 1)])
+}
+
+#[test]
+fn vop3_interp_forms_match_the_vintrp_lowering() {
+    let (ins, outs) = interp_signature();
+    let exp = [0xf800_1c01, 0x0000_0000, S_ENDPGM];
+    let mut vintrp = vec![vintrp_word(0, 0, 0, 2, 0), vintrp_word(1, 0, 0, 2, 1), vintrp_word(2, 0, 0, 2, 0)];
+    vintrp.extend_from_slice(&exp);
+    let mut vop3 = Vec::new();
+    for (op, vsrc) in [(0, 0), (1, 1), (2, 0)] {
+        vop3.extend_from_slice(&vop3_interp_words(op, 0, 0, 2, vsrc));
+    }
+    vop3.extend_from_slice(&exp);
+    let a = translate(&shader(Stage::Pixel, &vintrp, ins.clone(), outs.clone(), None)).expect("VINTRP interp translates");
+    let b = translate(&shader(Stage::Pixel, &vop3, ins, outs, None)).expect("VOP3 interp translates");
+    let body = |h: &str| h.lines().filter(|l| !l.trim_start().starts_with("// 0x")).map(str::to_string).collect::<Vec<_>>().join("\n");
+    assert_eq!(body(&a.hlsl), body(&b.hlsl));
+    assert!(b.hlsl.contains("v0 = TB_WV(asuint(i.i1.z), v0);"), "{}", b.hlsl);
+}
+
+#[test]
+fn vop3_interp_with_modifiers_is_refused() {
+    let (ins, outs) = interp_signature();
+    let mut words: Vec<u32> = vop3_interp_words(0, 0, 0, 0, 0).to_vec();
+    words[1] |= 1 << 30;
+    words.push(S_ENDPGM);
+    let err = match translate(&shader(Stage::Pixel, &words, ins, outs, None)) {
+        Ok(t) => panic!("{}", t.hlsl),
+        Err(e) => e,
+    };
+    assert!(err.contains("v_interp_p1_f32 VOP3 form with abs/neg/clamp/omod/opsel modifiers is not supported"), "{err}");
+}
+
+fn vop3_interp16_words(op: u32, vdst: u32, attr: u32, chan: u32, high: u32, vsrc: u32, vsrc2: u32) -> [u32; 2] {
+    [0xd400_0000 | (op << 16) | vdst, attr | (chan << 6) | (high << 8) | ((256 + vsrc) << 9) | ((256 + vsrc2) << 18)]
+}
+
+#[test]
+fn vop3_interp_f16_forms_decode_attr_chan_and_operands() {
+    use tombox_xshader::rdna2::{disassemble, Opnd};
+    let cases = [
+        (0x342, "v_interp_p1ll_f16", vec![Opnd::Vgpr(1)]),
+        (0x343, "v_interp_p1lv_f16", vec![Opnd::Vgpr(1), Opnd::Vgpr(5)]),
+        (0x35a, "v_interp_p2_f16", vec![Opnd::Vgpr(1), Opnd::Vgpr(5)]),
+    ];
+    for (op, name, src) in cases {
+        let isa: Vec<u8> = vop3_interp16_words(op, 4, 3, 2, 1, 1, 5).iter().flat_map(|w| w.to_le_bytes()).collect();
+        let ins = disassemble(&isa).into_iter().next().unwrap();
+        assert_eq!(ins.mnemonic, name);
+        assert_eq!(ins.dwords, 2, "{name}");
+        assert_eq!(ins.dst, vec![Opnd::Vgpr(4)], "{name}");
+        assert_eq!(ins.src, src, "{name}");
+        assert_eq!((ins.aux.imm, ins.aux.imm2), (3, 2), "{name} attr/chan");
+    }
+}
+
+#[test]
+fn vop3_interp_f16_forms_are_refused_with_attr_chan_and_half() {
+    let cases = [
+        (0x342, 0, 0, 0, "v_interp_p1ll_f16 attr0.x low half"),
+        (0x342, 0, 1, 1, "v_interp_p1ll_f16 attr0.y high half"),
+        (0x343, 0, 2, 0, "v_interp_p1lv_f16 attr0.z low half"),
+        (0x35a, 0, 3, 1, "v_interp_p2_f16 attr0.w high half"),
+    ];
+    for (op, attr, chan, high, want) in cases {
+        let (ins, outs) = interp_signature();
+        let mut words = vop3_interp16_words(op, 0, attr, chan, high, 0, 1).to_vec();
+        words.extend_from_slice(&[0xf800_1c01, 0x0000_0000, S_ENDPGM]);
+        let err = match translate(&shader(Stage::Pixel, &words, ins, outs, None)) {
+            Ok(t) => panic!("{want}: translated\n{}", t.hlsl),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains(&format!("{want}: the packing of 16-bit attributes into LDS dword halves is not established")),
+            "{err}"
+        );
+    }
+}
+
 #[test]
 fn pixel_attribute_past_the_interpolants_reads_the_layer_sysval() {
     let words = [0xc802_0002, 0xf800_1c03, 0x0000_0000, S_ENDPGM];
@@ -469,7 +563,7 @@ fn durango_vertex_fetch_call_synthesizes_attributes_from_input_signature() {
 }
 
 #[test]
-fn amplification_dispatch_uses_the_y_and_z_group_counts() {
+fn amplification_dispatch_uses_the_y_group_count_and_not_the_payload_pointer() {
     let mut ex = shader(Stage::Amplification, &[S_ENDPGM], vec![], vec![], None);
     ex.gs_info = Some(GsInfo {
         input_primitive: 0,
@@ -485,10 +579,11 @@ fn amplification_dispatch_uses_the_y_and_z_group_counts() {
             topology: 0,
             num_threads: [32, 1, 1],
         }),
+        tess: None,
     });
     let t = translate(&ex).expect("amplification shader translates");
     assert!(
-        t.hlsl.contains("DispatchMesh(tb_args[0], max(tb_args[1], 1u), max(tb_args[2], 1u), tb_pl);"),
+        t.hlsl.contains("DispatchMesh(tb_args[0], max(tb_args[1], 1u), 1u, tb_pl);"),
         "{}",
         t.hlsl
     );
@@ -502,7 +597,7 @@ fn geometry(prim: u32, topo: u32) -> Result<tombox_xshader::hlsl::Translated, St
         vec![sig("SV_Position", 1, 3, 0, 0xf)],
         None,
     );
-    ex.gs_info = Some(GsInfo { input_primitive: prim, output_topology: topo, max_vertex_count: 1, mesh: None });
+    ex.gs_info = Some(GsInfo { input_primitive: prim, output_topology: topo, max_vertex_count: 1, mesh: None, tess: None });
     translate(&ex)
 }
 
@@ -530,6 +625,32 @@ fn geometry_adjacency_primitives_translate() {
     assert!(err.contains("input primitive"), "{err}");
 }
 
+fn geometry_sendmsg(simm16: u32) -> Result<tombox_xshader::hlsl::Translated, String> {
+    let mut ex = shader(
+        Stage::Geometry,
+        &[0xbf90_0000 | simm16, S_ENDPGM],
+        vec![sig("POSITION", 0, 3, 0, 0xf)],
+        vec![sig("SV_Position", 1, 3, 0, 0xf)],
+        None,
+    );
+    ex.gs_info = Some(GsInfo { input_primitive: 1, output_topology: 1, max_vertex_count: 1, mesh: None, tess: None });
+    translate(&ex)
+}
+
+#[test]
+fn geometry_emit_and_cut_on_streams_1_to_3_are_refused() {
+    for stream in 1..4u32 {
+        for op in [1u32, 2, 3] {
+            let err = match geometry_sendmsg(2 | (op << 4) | (stream << 8)) {
+                Err(e) => e,
+                Ok(_) => panic!("GS op {op} on stream {stream} must not translate"),
+            };
+            assert!(err.contains("GS output stream != 0 unsupported"), "stream {stream} op {op}: {err}");
+        }
+    }
+    geometry_sendmsg(3).expect("GS_DONE translates");
+}
+
 fn compute_threads(threads: Option<[u32; 3]>, preamble: [u32; 4]) -> String {
     let mut ex = shader(Stage::Compute, &[S_ENDPGM], vec![], vec![], None);
     ex.psv_numthreads = threads;
@@ -551,6 +672,23 @@ fn compute_with(words: &[u32], preamble: [u32; 4]) -> String {
     let mut ex = shader(Stage::Compute, words, vec![], vec![], None);
     ex.isa_preamble = preamble;
     translate(&ex).expect("compute shader translates").hlsl
+}
+
+fn compute_refusal(words: &[u32]) -> String {
+    let ex = shader(Stage::Compute, words, vec![], vec![], None);
+    match translate(&ex) {
+        Err(e) => e,
+        Ok(t) => panic!("must not translate:
+{}", t.hlsl),
+    }
+}
+
+#[test]
+fn sendmsghalt_and_ordered_count_are_refused() {
+    let halt = compute_refusal(&[0xbf91_0000, S_ENDPGM]);
+    assert!(halt.contains("s_sendmsghalt halts the wave after the message"), "{halt}");
+    let ordered = compute_refusal(&[0xd8fe_0000, 0x0000_0101, S_ENDPGM]);
+    assert!(ordered.contains("ds_ordered_count: dispatch-ordered GDS append is not lowered"), "{ordered}");
 }
 
 fn consecutive_lds() -> [u32; 7] {
@@ -712,11 +850,63 @@ fn raw_uav_buffer_atomics_share_ubuf_instead_of_overlapping_utb() {
     let t = translate(&ex).expect("raw UAV buffer store + atomic");
     assert!(t.hlsl.contains("ubuf0"), "{}", t.hlsl);
     assert!(!t.hlsl.contains("utb0"), "overlapping utb0 declaration:\n{}", t.hlsl);
-    assert!(t.hlsl.contains("InterlockedOr(ubuf0["), "{}", t.hlsl);
+    assert!(t.hlsl.contains("RWByteAddressBuffer ubuf0"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("ubuf0.InterlockedOr("), "{}", t.hlsl);
+    assert!(t.hlsl.contains("ubuf0.Store("), "{}", t.hlsl);
     if tombox_xshader::dxc::available() {
         let profile = tombox_xshader::dxc::profile_for(t.profile);
         tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile");
     }
+}
+
+fn raw_buffer_shader(res_type: u32, range_type: u32, op_word: u32) -> ShaderExtract {
+    let words = [
+        0xf408_0002, 0xfa00_0000,
+        0x7e02_0284,
+        0x7e06_0287,
+        op_word, 0x8000_0301,
+        S_ENDPGM,
+    ];
+    let root = RootSig {
+        version: 2,
+        flags: 0,
+        params: vec![table(range_type, 1, 0)],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    };
+    let mut ex = shader(Stage::Compute, &words, vec![], vec![], Some(root));
+    ex.isa_preamble = [0, 64, 1, 1];
+    (ex.has_input_sig, ex.has_output_sig) = (false, false);
+    ex.has_psv0 = true;
+    ex.resources.push(PsvResource { res_type, space: 0, lower: 0, upper: 0, kind: 1 });
+    ex
+}
+
+#[test]
+fn raw_srv_buffer_is_a_byte_address_buffer() {
+    let t = translate(&raw_buffer_shader(4, 0, 0xe030_1014)).expect("raw SRV buffer_load_dword");
+    assert!(t.hlsl.contains("ByteAddressBuffer sbuf0"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("TbElem_sbuf0"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("= sbuf0.Load(((t"), "{}", t.hlsl);
+    if tombox_xshader::dxc::available() {
+        let profile = tombox_xshader::dxc::profile_for(t.profile);
+        tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile");
+    }
+}
+
+#[test]
+fn structured_srv_buffer_keeps_its_element_struct() {
+    let t = translate(&raw_buffer_shader(5, 0, 0xe030_1014)).expect("structured SRV buffer_load_dword");
+    assert!(t.hlsl.contains("StructuredBuffer<TbElem_sbuf0> sbuf0"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("ByteAddressBuffer"), "{}", t.hlsl);
+}
+
+#[test]
+fn raw_buffer_with_idxen_is_refused() {
+    let Err(e) = translate(&raw_buffer_shader(7, 1, 0xe0e8_2000)) else { panic!("raw UAV atomic with IDXEN translated") };
+    assert!(e.contains("raw buffer ubuf0 addressed with IDXEN"), "{e}");
+    let Err(e) = translate(&raw_buffer_shader(7, 1, 0xe070_2000)) else { panic!("raw UAV store with IDXEN translated") };
+    assert!(e.contains("raw buffer ubuf0 addressed with IDXEN"), "{e}");
 }
 
 #[test]
@@ -734,6 +924,35 @@ fn unmapped_position_export_without_clip_or_cull_distance_is_ignored() {
         let profile = tombox_xshader::dxc::profile_for(t.profile);
         tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile");
     }
+}
+
+fn exp(target: u32) -> [u32; 2] {
+    [0xf800_0000 | (target << 4) | 0xf | (1 << 10), 0x0302_0100]
+}
+
+#[test]
+fn ps_export_target_above_mrt7_is_refused() {
+    let ok = shader(Stage::Pixel, &[exp(0)[0], exp(0)[1], S_ENDPGM], vec![], vec![sig("SV_Target", 64, 3, 0, 0xf)], None);
+    translate(&ok).expect("mrt0 export translates");
+    let ex = shader(Stage::Pixel, &[exp(10)[0], exp(10)[1], S_ENDPGM], vec![], vec![sig("SV_Target", 64, 3, 0, 0xf)], None);
+    let err = match translate(&ex) {
+        Ok(t) => panic!("expected refusal, got:\n{}", t.hlsl),
+        Err(e) => e,
+    };
+    assert!(err.starts_with("PS export target 10 unsupported"), "{err}");
+}
+
+#[test]
+fn non_pixel_export_target_outside_position_and_parameters_is_refused() {
+    let out = || vec![sig("PRIMITIVE_ID", 0, 1, 0, 0x1)];
+    let ok = shader(Stage::Vertex, &[0xf800_0207, 0x0000_0000, S_ENDPGM], vec![], out(), None);
+    translate(&ok).expect("param0 export translates");
+    let ex = shader(Stage::Vertex, &[exp(10)[0], exp(10)[1], S_ENDPGM], vec![], out(), None);
+    let err = match translate(&ex) {
+        Ok(t) => panic!("expected refusal, got:\n{}", t.hlsl),
+        Err(e) => e,
+    };
+    assert!(err.starts_with("export target 10 unsupported"), "{err}");
 }
 
 #[test]
@@ -765,4 +984,96 @@ fn image_atomic_64bit_emits_uint64_uav_and_sm66() {
         let profile = tombox_xshader::dxc::profile_for(t.profile);
         tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile ps_6_6");
     }
+}
+
+fn ds_swizzle_op(offset: u32, addr: u32, vdst: u32) -> [u32; 2] {
+    [0xd800_0000 | (0x35 << 18) | (offset & 0xffff), addr | (vdst << 24)]
+}
+
+fn ps_out() -> Vec<SigElement> {
+    vec![sig("SV_Target", 64, 3, 0, 0xf)]
+}
+
+#[test]
+fn ds_swizzle_refusals_are_explicit() {
+    let words = [ds_swizzle_op(0x8000 | 0xe4, 2, 3)[0], ds_swizzle_op(0x8000 | 0xe4, 2, 3)[1], S_ENDPGM];
+    let vertex_out = || vec![sig("SV_Position", 1, 3, 0, 0xf)];
+    let err = match translate(&shader(Stage::Vertex, &words, vec![], vertex_out(), None)) {
+        Ok(t) => panic!("ds_swizzle in a vertex shader translated:\n{}", t.hlsl),
+        Err(e) => e,
+    };
+    assert!(err.contains("ds_swizzle outside a pixel shader"), "{err}");
+
+    let plain = ds_swizzle_op(0x001f, 2, 3);
+    let err = match translate(&shader(Stage::Pixel, &[plain[0], plain[1], S_ENDPGM], vec![], ps_out(), None)) {
+        Ok(t) => panic!("ds_swizzle without QDMode translated:\n{}", t.hlsl),
+        Err(e) => e,
+    };
+    assert!(err.contains("ds_swizzle without QDMode unsupported"), "{err}");
+
+    let quad = ds_swizzle_op(0x8000 | 0xe4, 2, 3);
+    let t = translate(&shader(Stage::Pixel, &[quad[0], quad[1], S_ENDPGM], vec![], ps_out(), None))
+        .expect("QDMode ds_swizzle translates");
+    assert!(t.hlsl.contains("uint tb_quad = ((uint)i.tb_pos.x & 1u) | (((uint)i.tb_pos.y & 1u) << 1);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("QuadReadLaneAt(v2, 0u)"), "{}", t.hlsl);
+}
+
+fn literal_sampler_shader(address: u32, last_sampler_word: u32) -> ShaderExtract {
+    let words = [
+        0x7e04_0280, 0x7e06_0280,
+        0xf40c_0200, 0xfa00_0000, 0xbf8c_c07f,
+        0xbe90_03ff, 0x0000_0092,
+        0xbe91_03ff, 0x00c0_0000,
+        0xbe92_0380, last_sampler_word,
+        0xf080_0f08, 0x0082_0402, 0xbf8c_3f70,
+        0xf800_180f, 0x0706_0504, S_ENDPGM,
+    ];
+    let root = RootSig {
+        version: 1,
+        flags: 0,
+        params: vec![table(0, 1, 5)],
+        num_static_samplers: 1,
+        static_samplers: vec![StaticSampler {
+            filter: 0,
+            address_u: address,
+            address_v: address,
+            address_w: address,
+            comparison_func: 1,
+            max_anisotropy: 1,
+            border_color: 0,
+            min_lod_bits: 0,
+            max_lod_bits: f32::MAX.to_bits(),
+            register: 0,
+            space: 0,
+            visibility: 5,
+        }],
+    };
+    let mut ex = shader(
+        Stage::Pixel, &words, vec![], vec![sig("SV_Target", 64, 3, 0, 0xf)], Some(root),
+    );
+    ex.has_psv0 = true;
+    ex.resources = vec![
+        PsvResource { res_type: 3, space: 0, lower: 0, upper: 0, kind: 2 },
+        PsvResource { res_type: 1, space: 0, lower: 0, upper: 0, kind: 14 },
+    ];
+    ex
+}
+
+#[test]
+fn rdna2_literal_sampler_uses_the_static_root_binding() {
+    let ex = literal_sampler_shader(3, 0xbe93_0380);
+    let translated = translate(&ex).expect("translate a clamp sampler");
+    assert!(translated.hlsl.contains("register(s0)"));
+    assert!(translated.hlsl.contains("register(t0)"));
+}
+
+#[test]
+fn rdna2_literal_sampler_rejects_incompatible_or_unproven_bindings() {
+    let wrong_address = translate(&literal_sampler_shader(1, 0xbe93_0380))
+        .err().expect("reject a wrap sampler for a clamp descriptor");
+    assert!(wrong_address.contains("no static sampler has the decoded address modes"), "{wrong_address}");
+
+    let nonliteral_word = translate(&literal_sampler_shader(3, 0xbe93_0314))
+        .err().expect("reject a nonliteral sampler word");
+    assert!(nonliteral_word.contains("not a sampler descriptor"), "{nonliteral_word}");
 }

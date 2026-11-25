@@ -25,6 +25,7 @@ const READING_NOT_FOUND: i32 = 0x838A_0003u32 as i32;
 const DEVICE_DISCONNECTED: i32 = 0x838A_0001u32 as i32;
 const REFERENCE_READING_TOO_OLD: i32 = 0x838A_0004u32 as i32;
 const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+const E_NOTFOUND: i32 = 0x8007_0490u32 as i32;
 
 pub const BTN_MENU: u32 = 0x1;
 pub const BTN_VIEW: u32 = 0x2;
@@ -594,6 +595,10 @@ fn now_us() -> u64 {
         let g: unsafe extern "system" fn(usize) -> u64 = unsafe { core::mem::transmute(f) };
         return unsafe { g(real) };
     }
+    qpc_us()
+}
+
+fn qpc_us() -> u64 {
     let (mut c, mut q) = (0i64, 1i64);
     unsafe {
         QueryPerformanceCounter(&mut c);
@@ -753,6 +758,162 @@ unsafe extern "system" fn gi_find_obj(this: *mut c_void, obj: *mut c_void, out: 
 const IGAMEINPUT_SLOTS: usize = 22;
 static mut GI_VTBL: [usize; 32] = [0; 32];
 
+#[repr(C)]
+struct Standin {
+    vtbl: *const usize,
+}
+
+static mut STANDIN_VTBL: [usize; IGAMEINPUT_SLOTS] = [0; IGAMEINPUT_SLOTS];
+static mut STANDIN: Standin = Standin { vtbl: core::ptr::null() };
+static STANDIN_INIT: std::sync::Once = std::sync::Once::new();
+static STANDIN_REFS: AtomicU32 = AtomicU32::new(1);
+static STANDIN_TOKENS: AtomicU64 = AtomicU64::new(0x5442_0000_0000_0001);
+static STANDIN_LIVE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+fn standin_token(token: *mut u64) -> i32 {
+    if token.is_null() {
+        return E_INVALIDARG;
+    }
+    let t = STANDIN_TOKENS.fetch_add(1, Ordering::SeqCst);
+    STANDIN_LIVE.lock().unwrap_or_else(|e| e.into_inner()).push(t);
+    unsafe { *token = t };
+    S_OK
+}
+
+fn standin_forget(token: u64) -> bool {
+    let mut live = STANDIN_LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    match live.iter().position(|t| *t == token) {
+        Some(i) => {
+            live.swap_remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
+unsafe extern "system" fn sd_qi(this: *mut c_void, _iid: *const u8, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return 0x8000_4003u32 as i32;
+    }
+    sd_addref(this);
+    *out = this;
+    S_OK
+}
+unsafe extern "system" fn sd_addref(_this: *mut c_void) -> u32 {
+    STANDIN_REFS.fetch_add(1, Ordering::SeqCst) + 1
+}
+unsafe extern "system" fn sd_release(_this: *mut c_void) -> u32 {
+    let prev = STANDIN_REFS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1).max(1))).unwrap_or(1);
+    prev.saturating_sub(1).max(1)
+}
+unsafe extern "system" fn sd_timestamp(_this: *mut c_void) -> u64 {
+    qpc_us()
+}
+unsafe extern "system" fn sd_reading4(_this: *mut c_void, _a: usize, _b: *mut c_void, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return 0x8000_4003u32 as i32;
+    }
+    *out = core::ptr::null_mut();
+    READING_NOT_FOUND
+}
+unsafe extern "system" fn sd_reading5(_this: *mut c_void, _r: *mut c_void, _kind: u32, _d: *mut c_void, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return 0x8000_4003u32 as i32;
+    }
+    *out = core::ptr::null_mut();
+    READING_NOT_FOUND
+}
+unsafe extern "system" fn sd_reading_cb(_this: *mut c_void, _d: *mut c_void, _kind: u32, _t: f32, _ctx: *mut c_void, _cb: usize, token: *mut u64) -> i32 {
+    if !token.is_null() {
+        *token = 0;
+    }
+    E_NOTIMPL
+}
+unsafe extern "system" fn sd_device_cb(_this: *mut c_void, _d: *mut c_void, _kind: u32, _f: u32, _e: u32, _ctx: *mut c_void, _cb: usize, token: *mut u64) -> i32 {
+    standin_token(token)
+}
+unsafe extern "system" fn sd_button_cb(_this: *mut c_void, _d: *mut c_void, _f: u32, _ctx: *mut c_void, _cb: usize, token: *mut u64) -> i32 {
+    standin_token(token)
+}
+unsafe extern "system" fn sd_layout_cb(_this: *mut c_void, _d: *mut c_void, _ctx: *mut c_void, _cb: usize, token: *mut u64) -> i32 {
+    standin_token(token)
+}
+unsafe extern "system" fn sd_stop(_this: *mut c_void, token: u64) {
+    standin_forget(token);
+}
+unsafe extern "system" fn sd_unregister(_this: *mut c_void, token: u64, _timeout: u64) -> u32 {
+    standin_forget(token) as u32
+}
+unsafe extern "system" fn sd_create2(_this: *mut c_void, out: *mut *mut c_void) -> i32 {
+    if !out.is_null() {
+        *out = core::ptr::null_mut();
+    }
+    E_NOTIMPL
+}
+unsafe extern "system" fn sd_create3(_this: *mut c_void, _kind: u32, out: *mut *mut c_void) -> i32 {
+    if !out.is_null() {
+        *out = core::ptr::null_mut();
+    }
+    E_NOTIMPL
+}
+unsafe extern "system" fn sd_find(_this: *mut c_void, _key: *const c_void, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return 0x8000_4003u32 as i32;
+    }
+    *out = core::ptr::null_mut();
+    E_NOTFOUND
+}
+unsafe extern "system" fn sd_oem(_this: *mut c_void, _vid: u16, _pid: u16, _iface: u8, _cat: u8) -> i32 {
+    S_OK
+}
+unsafe extern "system" fn sd_focus(_this: *mut c_void, _policy: u32) {}
+
+fn standin() -> *mut c_void {
+    STANDIN_INIT.call_once(|| unsafe {
+        let vt = &mut *core::ptr::addr_of_mut!(STANDIN_VTBL);
+        let slots: [usize; IGAMEINPUT_SLOTS] = [
+            sd_qi as usize,
+            sd_addref as usize,
+            sd_release as usize,
+            sd_timestamp as usize,
+            sd_reading4 as usize,
+            sd_reading5 as usize,
+            sd_reading5 as usize,
+            sd_reading4 as usize,
+            sd_reading_cb as usize,
+            sd_device_cb as usize,
+            sd_button_cb as usize,
+            sd_layout_cb as usize,
+            sd_stop as usize,
+            sd_unregister as usize,
+            sd_create2 as usize,
+            sd_create3 as usize,
+            sd_find as usize,
+            sd_find as usize,
+            sd_find as usize,
+            sd_find as usize,
+            sd_oem as usize,
+            sd_focus as usize,
+        ];
+        *vt = slots;
+        (*core::ptr::addr_of_mut!(STANDIN)).vtbl = vt.as_ptr();
+    });
+    core::ptr::addr_of_mut!(STANDIN) as *mut c_void
+}
+
+unsafe fn adopt_standin(out: *mut *mut c_void) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let obj = standin();
+    patch_object(obj);
+    if REAL_THIS.load(Ordering::SeqCst) != obj as usize {
+        return false;
+    }
+    *out = obj;
+    true
+}
+
 unsafe fn patch_object(obj: *mut c_void) {
     let vptr = obj as *mut *const usize;
     let cur = *vptr as usize;
@@ -802,6 +963,12 @@ unsafe extern "system" fn create_hook(out: *mut *mut c_void) -> i32 {
         crate::pad_host::start();
     } else {
         log("GameInputCreate", &format!("real GameInputCreate failed hr={hr:#x}"));
+        if adopt_standin(out) {
+            start_channel();
+            crate::pad_host::start();
+            log("GameInputCreate", &format!("no host GameInput (hr={hr:#x}): returned a stand-in IGameInput with no host devices and the virtual Xbox gamepad, hr=0 as on console"));
+            return S_OK;
+        }
     }
     hr
 }
@@ -1065,6 +1232,85 @@ mod tests {
                 assert!(e.seq > before && e.seq <= seq);
             }
             other => panic!("host change not in the reading history: {other:?}"),
+        }
+    }
+
+    unsafe fn slot<T>(obj: *mut c_void, i: usize) -> T {
+        let vt = *(obj as *const *const usize);
+        core::mem::transmute_copy(&*vt.add(i))
+    }
+
+    #[test]
+    fn failed_create_hands_out_a_standin_gameinput_with_the_virtual_pad() {
+        unsafe {
+            let mut obj: *mut c_void = core::ptr::null_mut();
+            assert!(adopt_standin(&mut obj));
+            assert_eq!(obj, standin());
+            assert_eq!(*(obj as *const usize), core::ptr::addr_of!(GI_VTBL) as usize);
+            let mut again: *mut c_void = core::ptr::null_mut();
+            assert!(adopt_standin(&mut again));
+            assert_eq!(again, obj);
+            assert!(!adopt_standin(core::ptr::null_mut()));
+
+            let qi: unsafe extern "system" fn(*mut c_void, *const u8, *mut *mut c_void) -> i32 = slot(obj, 0);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = slot(obj, 2);
+            let mut same: *mut c_void = core::ptr::null_mut();
+            assert_eq!(qi(obj, [0u8; 16].as_ptr(), &mut same), S_OK);
+            assert_eq!(same, obj);
+            assert!(release(obj) >= 1);
+
+            let ts: unsafe extern "system" fn(*mut c_void) -> u64 = slot(obj, 3);
+            let t0 = ts(obj);
+            let t1 = ts(obj);
+            assert!(t0 > 0 && t1 >= t0);
+
+            let current: unsafe extern "system" fn(*mut c_void, u32, *mut c_void, *mut *mut c_void) -> i32 = slot(obj, 4);
+            let mut r = 1usize as *mut c_void;
+            assert_eq!(current(obj, KIND_KEYBOARD, core::ptr::null_mut(), &mut r), READING_NOT_FOUND);
+            assert!(r.is_null());
+
+            let device_cb: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, usize, *mut u64) -> i32 = slot(obj, 9);
+            let mut token = 0u64;
+            assert_eq!(device_cb(obj, core::ptr::null_mut(), KIND_KEYBOARD, STATUS_CONNECTED, 1, core::ptr::null_mut(), 0, &mut token), S_OK);
+            assert_ne!(token, 0);
+            let button_cb: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, usize, *mut u64) -> i32 = slot(obj, 10);
+            let mut token2 = 0u64;
+            assert_eq!(button_cb(obj, core::ptr::null_mut(), 1, core::ptr::null_mut(), 0, &mut token2), S_OK);
+            assert!(token2 != 0 && token2 != token);
+            let reading_cb: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, f32, *mut c_void, usize, *mut u64) -> i32 = slot(obj, 8);
+            let mut token3 = 9u64;
+            assert_eq!(reading_cb(obj, core::ptr::null_mut(), KIND_GAMEPAD, 0.0, core::ptr::null_mut(), 0, &mut token3), E_NOTIMPL);
+            assert_eq!(token3, 0);
+            let stop: unsafe extern "system" fn(*mut c_void, u64) = slot(obj, 12);
+            stop(obj, token);
+            let unregister: unsafe extern "system" fn(*mut c_void, u64, u64) -> u32 = slot(obj, 13);
+            assert_eq!(unregister(obj, token, 0), 0);
+            assert_eq!(unregister(obj, token2, 0), 1);
+            assert_eq!(unregister(obj, token2, 0), 0);
+            assert_eq!(unregister(obj, 0x1234, 0), 0);
+            assert_eq!(device_cb(obj, core::ptr::null_mut(), KIND_KEYBOARD, STATUS_CONNECTED, 1, core::ptr::null_mut(), 0, core::ptr::null_mut()), E_INVALIDARG);
+
+            let dispatcher: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32 = slot(obj, 14);
+            let mut d = 1usize as *mut c_void;
+            assert_eq!(dispatcher(obj, &mut d), E_NOTIMPL);
+            assert!(d.is_null());
+
+            let find_id: unsafe extern "system" fn(*mut c_void, *const [u8; 32], *mut *mut c_void) -> i32 = slot(obj, 16);
+            let mut dev: *mut c_void = core::ptr::null_mut();
+            assert_eq!(find_id(obj, &DEVICE_ID, &mut dev), S_OK);
+            assert_eq!(dev, vdev());
+            let other = [7u8; 32];
+            assert_eq!(find_id(obj, &other, &mut dev), E_NOTFOUND);
+            assert!(dev.is_null());
+            let find_obj: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> i32 = slot(obj, 17);
+            assert_eq!(find_obj(obj, vdev(), &mut dev), S_OK);
+            assert_eq!(dev, vdev());
+
+            let oem: unsafe extern "system" fn(*mut c_void, u16, u16, u8, u8) -> i32 = slot(obj, 20);
+            assert_eq!(oem(obj, 0x045e, 0x0b12, 0, 1), S_OK);
+            let focus: unsafe extern "system" fn(*mut c_void, u32) = slot(obj, 21);
+            focus(obj, 0);
+            assert!(now_us() > 0);
         }
     }
 

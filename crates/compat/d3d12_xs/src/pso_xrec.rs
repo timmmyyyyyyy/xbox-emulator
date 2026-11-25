@@ -815,7 +815,8 @@ mod tests {
     fn unknown_root_signatures_ext_entries_and_cached_blobs_are_not_recorded() {
         let (vs, ps) = (vec![1u8; 64], vec![2u8; 64]);
         let n = b"POSITION\0".to_vec();
-        let mut d = gfx_desc(&vs, &ps, &[elem(&n, 6, 0)], 0x6000);
+        let il = [elem(&n, 6, 0)];
+        let mut d = gfx_desc(&vs, &ps, &il, 0x6000);
         let none = |_: usize| None;
         assert!(matches!(unsafe { capture(GFX, d.as_ptr(), 0, &none) }, Capture::Skip(c) if core::ptr::eq(c, &SKIP_ROOT)));
         assert!(matches!(unsafe { capture(GFX, d.as_ptr(), 1, &none) }, Capture::Skip(c) if core::ptr::eq(c, &SKIP_EXT)));

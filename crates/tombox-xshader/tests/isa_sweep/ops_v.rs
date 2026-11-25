@@ -463,16 +463,10 @@ fn frexp16(x: u32) -> (u32, u32) {
 }
 
 fn rpi(x: u32) -> Option<u32> {
-    let v = f(x);
-    if v.is_nan() {
-        return Some(0);
+    if nan32(x) {
+        return Some(if x & 0x8000_0000 != 0 { 0x8000_0000 } else { 0x7fff_ffff });
     }
-    let exact = (v as f64 + 0.5).floor();
-    let rounded = (v + 0.5).floor() as f64;
-    if exact != rounded {
-        return None;
-    }
-    Some(cvt_i32(exact))
+    Some(cvt_i32((f(x) as f64 + 0.5).floor()))
 }
 
 fn fract32(x: u32) -> Option<u32> {
@@ -504,7 +498,7 @@ fn vop1_ops(s: &mut Suite) {
     f1(s, "v_cvt_u32_f32", 0x07, Class::F32, Cmp::X, |a| Some(cvt_u32(f(a) as f64)), false);
     f1(s, "v_cvt_i32_f32", 0x08, Class::F32, Cmp::X, |a| Some(cvt_i32(f(a) as f64)), false);
     f1(s, "v_cvt_rpi_i32_f32", 0x0c, Class::F32, Cmp::X, rpi, false);
-    f1(s, "v_cvt_flr_i32_f32", 0x0d, Class::F32, Cmp::X, |a| if den32(a) { None } else { Some(if nan32(a) { 0 } else { cvt_i32((f(a) as f64).floor()) }) }, false);
+    f1(s, "v_cvt_flr_i32_f32", 0x0d, Class::F32, Cmp::X, |a| if den32(a) { None } else if nan32(a) { Some(if a & 0x8000_0000 != 0 { 0x8000_0000 } else { 0x7fff_ffff }) } else { Some(cvt_i32((f(a) as f64).floor())) }, false);
     f1(s, "v_cvt_f32_f16", 0x0b, Class::F16, Cmp::F32(0), |a| Some(f32q(h2f(a & 0xffff))), false);
     s.add("v_cvt_f16_f32", "VOP1", "e32", Class::F32, &[vmov(OUT, v(12))], &[vop1(0x0a, OUT, v(10))], &[], &[Cmp::F16(0)], |x| o((x.d[2] & 0xffff_0000) | f2h_rne(f(x.d[0]))));
     s.add("v_cvt_f16_f32", "VOP1", "e64 opsel dst hi", Class::F32, &[vmov(OUT, v(12))], &vop3m(0x18a, OUT, [v(11), 0, 0], 0, 0, 0b1000, false), &[], &[Cmp::X], |x| {
@@ -782,8 +776,8 @@ fn vop3_ops(s: &mut Suite) {
     let ints: &[(&'static str, u32, Class, F3)] = &[
         ("v_mad_i32_i24", 0x142, Class::U32, |a, b, c| ((s24(a) * s24(b)) as u32).wrapping_add(c)),
         ("v_mad_u32_u24", 0x143, Class::U32, |a, b, c| (((a as u64 & 0xff_ffff) * (b as u64 & 0xff_ffff)) as u32).wrapping_add(c)),
-        ("v_bfe_u32", 0x148, Class::Small, |a, b, c| bfe_u(a, b, c)),
-        ("v_bfe_i32", 0x149, Class::Small, |a, b, c| bfe_i(a, b, c)),
+        ("v_bfe_u32", 0x148, Class::U32, |a, off, w| bfe_u(a, off, w)),
+        ("v_bfe_i32", 0x149, Class::U32, |a, off, w| bfe_i(a, off, w)),
         ("v_bfi_b32", 0x14a, Class::U32, |a, b, c| (a & b) | (!a & c)),
         ("v_lerp_u8", 0x14d, Class::U32, |a, b, c| (0..4).fold(0, |acc, k| acc | (((((a >> (8 * k)) & 0xff) + ((b >> (8 * k)) & 0xff) + ((c >> (8 * k)) & 1)) >> 1) << (8 * k)))),
         ("v_alignbit_b32", 0x14e, Class::Small, |a, b, c| ((((a as u64) << 32) | b as u64) >> (c & 31)) as u32),
@@ -885,10 +879,10 @@ fn vop3_ops(s: &mut Suite) {
         let r = x.d[0] as u128 * x.d[1] as u128 + acc;
         vec![Some(r as u32), Some((r >> 32) as u32), Some((r >> 64) as u32 & 1)]
     });
-    s.add("v_mad_i64_i32", "VOP3", "sdst=s42", Class::U32, &[], &vop3b(0x177, OUT, 42, [v(10), v(11), v(12)]), &[], &[Cmp::X, Cmp::X], |x| {
-        let acc = (x.d[2] as u64 | ((x.d[3] as u64) << 32)) as i64;
-        let r = (x.d[0] as i32 as i64).wrapping_mul(x.d[1] as i32 as i64).wrapping_add(acc) as u64;
-        o64(r)
+    s.add("v_mad_i64_i32", "VOP3", "sdst=s42", Class::U32, &[], &vop3b(0x177, OUT, 42, [v(10), v(11), v(12)]), &mask_to(OUT + 2, 42), &[Cmp::X, Cmp::X, Cmp::X], |x| {
+        let acc = (x.d[2] as u64 | ((x.d[3] as u64) << 32)) as i64 as i128;
+        let r = (x.d[0] as i32 as i128) * (x.d[1] as i32 as i128) + acc;
+        vec![Some(r as u64 as u32), Some(((r as u64) >> 32) as u32), Some((r < 0) as u32)]
     });
     s.add("v_ldexp_f32", "VOP3", "v,v", Class::F32, &[], &vop3(0x362, OUT, [v(10), v(11), 0]), &[], &[Cmp::F32(0)], |x| o(if nan32(x.d[0]) { QNAN32 } else { ldexp32(f(x.d[0]), x.d[1] as i32).to_bits() }));
     s.add("v_ldexp_f32", "VOP3", "v,small", Class::Small, &[vop2(0x26, 32, v(11), 13)], &vop3(0x362, OUT, [v(12), v(32), 0]), &[], &[Cmp::F32(0)], |x| {

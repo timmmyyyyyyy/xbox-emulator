@@ -148,10 +148,7 @@ impl Emitter<'_> {
         None
     }
 
-    pub(super) fn dg_static_sampler(&self, idx: usize, ss: u16) -> Result<Option<u32>, String> {
-        if self.dg().is_none() {
-            return Ok(None);
-        }
+    pub(super) fn static_sampler(&self, idx: usize, ss: u16) -> Result<Option<u32>, String> {
         let Some(rs) = self.ex.root_sig.as_ref() else { return Ok(None) };
         let vis = match self.ex.stage {
             crate::Stage::Vertex => 1,
@@ -162,6 +159,26 @@ impl Emitter<'_> {
             _ => 0,
         };
         let cands: Vec<_> = rs.static_samplers.iter().filter(|s| s.visibility == 0 || s.visibility == vis).collect();
+        if self.dg().is_none() {
+            if cands.is_empty() || ss > 102 || self.insns.iter().any(|ins| {
+                ins.mnemonic.contains("branch") || ins.mnemonic.contains("setpc")
+                    || ins.mnemonic.contains("swappc") || ins.mnemonic.starts_with("s_call")
+                    || ins.mnemonic.starts_with("s_rfe")
+            }) || self.insns[..idx].iter().any(|ins| ins.mnemonic.starts_with("s_endpgm")) {
+                return Ok(None);
+            }
+            let words = [0, 1, 2, 3].map(|word| Self::sgpr_const_in(&self.insns, 0, idx, (ss + word) as u8));
+            let [Some(w0), Some(w1), Some(w2), Some(_)] = words else {
+                return Ok(None);
+            };
+            let decoded = decode_ssharp(w0, Some(w1), Some(w2), is_compare_sample(&self.insns[idx].mnemonic));
+            let owned: Vec<StaticSampler> = cands.iter().map(|s| **s).collect();
+            let pick = pick_static_sampler(&decoded, &owned)
+                .map_err(|why| format!("literal sampler s{ss} (decoded {decoded:?}): {why}"))?;
+            let sampler = owned[pick];
+            return Ok(Some((sampler.space << 16) | sampler.register));
+        }
+
         let pick = match cands.len() {
             0 => return Ok(None),
             1 => *cands[0],
@@ -252,8 +269,40 @@ fn soft_score(d: &SSharp, s: &StaticSampler) -> u32 {
     n
 }
 
-fn same_state(a: &StaticSampler, b: &StaticSampler) -> bool {
+pub(super) fn same_state(a: &StaticSampler, b: &StaticSampler) -> bool {
     StaticSampler { register: 0, space: 0, visibility: 0, ..*a } == StaticSampler { register: 0, space: 0, visibility: 0, ..*b }
+}
+
+pub fn literal_mismatch(d: &SSharp, w3: u32, s: &StaticSampler) -> Option<String> {
+    let addr = [s.address_u, s.address_v, s.address_w];
+    if addr != d.addr {
+        return Some(format!("address modes {addr:?}, literal {:?}", d.addr));
+    }
+    let reduction = (s.filter >> 7) & 3;
+    if reduction != d.reduction {
+        return Some(format!("filter reduction {reduction}, literal {}", d.reduction));
+    }
+    if reduction == 1 && s.comparison_func != d.cmp_func {
+        return Some(format!("comparison function {}, literal {}", s.comparison_func, d.cmp_func));
+    }
+    let basic = s.filter & 0x7f;
+    match (d.filter, d.max_aniso) {
+        (Some(_), Some(a)) if basic & 0x40 == 0 || s.max_anisotropy != a => return Some(format!("filter {basic:#x} anisotropy {}, literal anisotropic x{a}", s.max_anisotropy)),
+        (Some(f), None) if basic != f => return Some(format!("filter {basic:#x}, literal {f:#x}")),
+        _ => {}
+    }
+    if addr.contains(&4) {
+        let ok = match w3 >> 30 {
+            0 => s.border_color == 0,
+            1 => matches!(s.border_color, 1 | 3),
+            2 => matches!(s.border_color, 2 | 4),
+            _ => false,
+        };
+        if !ok {
+            return Some(format!("border colour {}, literal border type {}", s.border_color, w3 >> 30));
+        }
+    }
+    None
 }
 
 pub fn pick_static_sampler(d: &SSharp, cands: &[StaticSampler]) -> Result<usize, String> {
@@ -300,6 +349,15 @@ mod ssharp_tests {
         assert_eq!(pick_static_sampler(&d, &[ss(0x15, 3, 4, 5), ss(0x15, 3, 4, 6)]), Ok(0));
         assert!(pick_static_sampler(&d, &[ss(0x15, 3, 4, 5), ss(0x14, 3, 4, 6)]).is_err());
         assert!(pick_static_sampler(&d, &[ss(0x15, 1, 4, 5)]).is_err());
+    }
+
+    #[test]
+    fn buffer_load_overwrite_invalidates_a_literal_sampler_word() {
+        let words = [0xbe93_0380u32, 0xf428_0400, 0xfa00_0000];
+        let isa: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let insns = crate::rdna2::disassemble(&isa);
+        assert_eq!(insns[1].mnemonic, "s_buffer_load_dwordx4");
+        assert_eq!(Emitter::sgpr_const_in(&insns, 0, insns.len(), 19), None);
     }
 
     #[test]

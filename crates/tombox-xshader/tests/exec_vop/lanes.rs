@@ -254,6 +254,63 @@ fn readlane_writelane_lanes() {
     }
 }
 
+fn readlane_special_cases(cs: &mut Vec<LaneCase>, width: u32) {
+    let ks: Vec<u32> = if width >= 32 { vec![0, 5, 31] } else { vec![0, 3] };
+    for &k in &ks {
+        let mut b = seed(5, MA, AA);
+        b.extend_from_slice(&[sop1(3, 124, LIT), 0x1357_2468]);
+        let at = b.len();
+        b.extend_from_slice(&vop3(0x360, 124, [v(5), ic(k as i32), 0]));
+        b.extend_from_slice(&[vop1(1, 0, 124), vop1(1, 1, v(5)), vop1(1, 2, v(LANE)), vop1(1, 3, ic(0))]);
+        cs.push(LaneCase { m: "v_readlane_b32", width: k + 1, body: b, at, exp: lanes_of(|l| [lane_val(k as usize, MA, AA), lane_val(l, MA, AA), l as u32, 0], k + 1) });
+
+        let mut b = seed(5, MA, AA);
+        b.extend_from_slice(&[sop1(3, 11, LIT), k, sop1(3, 124, LIT), 0x1357_2468]);
+        b.extend_from_slice(&set_exec(!(1u32 << k)));
+        let at = b.len();
+        b.extend_from_slice(&vop3(0x360, 124, [v(5), 11, 0]));
+        b.extend_from_slice(&all_exec());
+        b.extend_from_slice(&[vop1(1, 0, 124), vop1(1, 1, v(5)), vop1(1, 2, v(LANE)), vop1(1, 3, ic(0))]);
+        cs.push(LaneCase { m: "v_readlane_b32", width: k + 1, body: b, at, exp: lanes_of(|l| [lane_val(k as usize, MA, AA), lane_val(l, MA, AA), l as u32, 0], k + 1) });
+
+        let mut b = seed(5, MA, AA);
+        b.extend_from_slice(&[sop1(3, 124, LIT), 0x1357_2468]);
+        let at = b.len();
+        b.extend_from_slice(&vop3(0x360, 125, [v(5), ic(k as i32), 0]));
+        b.extend_from_slice(&[vop1(1, 0, 124), vop1(1, 1, v(5)), vop1(1, 2, v(LANE)), vop1(1, 3, ic(0))]);
+        cs.push(LaneCase { m: "v_readlane_b32", width: k + 1, body: b, at, exp: lanes_of(|l| [0x1357_2468, lane_val(l, MA, AA), l as u32, 0], k + 1) });
+
+        for dst in [107u32, 127] {
+            let mut b = seed(5, MA, AA);
+            let at = b.len();
+            b.extend_from_slice(&vop3(0x360, dst, [v(5), ic(k as i32), 0]));
+            b.extend_from_slice(&[vop1(1, 0, dst), vop1(1, 1, v(5)), vop1(1, 2, v(LANE)), vop1(1, 3, ic(0))]);
+            cs.push(LaneCase { m: "v_readlane_b32", width: k + 1, body: b, at, exp: lanes_of(|l| [lane_val(k as usize, MA, AA), lane_val(l, MA, AA), l as u32, 0], k + 1) });
+        }
+    }
+
+    for (dst, read_dst, want) in [(124u32, 124u32, 0xdead_beefu32), (125, 124, 0x1357_2468), (107, 107, 0xdead_beef), (127, 127, 0xdead_beef)] {
+        let mut b = vec![sop1(3, 10, LIT), 0xdead_beef, sop1(3, 124, LIT), 0x1357_2468];
+        b.extend_from_slice(&vop3(0x361, 9, [10, ic(0), 0]));
+        let at = b.len();
+        b.extend_from_slice(&vop3(0x360, dst, [v(9), ic(0), 0]));
+        b.extend_from_slice(&[vop1(1, 0, read_dst), vop1(1, 1, ic(0)), vop1(1, 2, v(LANE)), vop1(1, 3, ic(0))]);
+        cs.push(LaneCase { m: "v_readlane_b32", width: 1, body: b, at, exp: lanes_of(|l| [want, 0, l as u32, 0], 1) });
+    }
+}
+
+#[test]
+fn readlane_special_scalar_dsts() {
+    let mut cs = Vec::new();
+    readlane_special_cases(&mut cs, 4);
+    run_lane_cases("lanes_rw_special_warp", Dev::Warp, &cs);
+    if hw_requested() {
+        let mut cs = Vec::new();
+        readlane_special_cases(&mut cs, 32);
+        run_lane_cases("lanes_rw_special_hw", Dev::Hw, &cs);
+    }
+}
+
 pub fn permlane(x16: bool, src: &[u32], old: &[u32], exec: u32, lo: u32, hi: u32, fi: bool, bc: bool) -> Vec<u32> {
     (0..WAVE)
         .map(|i| {

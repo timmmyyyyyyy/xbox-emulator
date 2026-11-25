@@ -95,7 +95,7 @@ fn sop2_ops(s: &mut Suite) {
         ("s_lshl_b32", 0x1e, Class::Small, |a, b, _| { let r = a << (b & 31); (r, Some(nz(r as u64))) }),
         ("s_lshr_b32", 0x20, Class::Small, |a, b, _| { let r = a >> (b & 31); (r, Some(nz(r as u64))) }),
         ("s_ashr_i32", 0x22, Class::Small, |a, b, _| { let r = ((a as i32) >> (b & 31)) as u32; (r, Some(nz(r as u64))) }),
-        ("s_bfm_b32", 0x24, Class::Small, |a, b, _| ((((1u64 << (a & 31)) - 1) as u32) << (b & 31), None)),
+        ("s_bfm_b32", 0x24, Class::U32, |a, b, _| ((((1u64 << (a & 31)) - 1) as u32) << (b & 31), None)),
         ("s_mul_i32", 0x26, Class::U32, |a, b, _| ((a as i32).wrapping_mul(b as i32) as u32, None)),
         ("s_absdiff_i32", 0x2c, Class::U32, |a, b, _| { let r = (a as i32).wrapping_sub(b as i32).wrapping_abs() as u32; (r, Some(nz(r as u64))) }),
         ("s_lshl1_add_u32", 0x2e, Class::U32, |a, b, _| { let r = ((a as u64) << 1) + b as u64; (r as u32, Some((r >> 32 != 0) as u32)) }),
@@ -237,6 +237,10 @@ fn sop1_ops(s: &mut Suite) {
         ("s_not_b64", 0x08, |a, _, _| (!a, Some(nz(!a)))),
         ("s_wqm_b64", 0x0a, |a, _, _| { let r = wqm(a, 64); (r, Some(nz(r))) }),
         ("s_brev_b64", 0x0c, |a, _, _| (a.reverse_bits(), None)),
+        ("s_bitreplicate_b64_b32", 0x3b, |a, _, _| {
+            let pairs = (0..32).fold(0, |out, bit| out | (((a >> bit) & 1) * 3 << (2 * bit)));
+            (pairs, None)
+        }),
         ("s_bitset0_b64", 0x1c, |a, d, _| (d & !(1u64 << (a & 63)), None)),
         ("s_bitset1_b64", 0x1e, |a, d, _| (d | (1u64 << (a & 63)), None)),
     ];
@@ -341,7 +345,7 @@ pub fn add(s: &mut Suite) {
     sop1_ops(s);
     sopk_ops(s);
     sopc_ops(s);
-    for m in ["s_and_saveexec_b64", "s_or_saveexec_b64", "s_xor_saveexec_b64", "s_andn2_saveexec_b64", "s_orn2_saveexec_b64", "s_nand_saveexec_b64", "s_andn1_saveexec_b64", "s_orn1_saveexec_b64", "s_and_saveexec_b32", "s_or_saveexec_b32", "s_xor_saveexec_b32", "s_andn2_saveexec_b32", "s_orn2_saveexec_b32"] {
+    for m in ["s_and_saveexec_b64", "s_or_saveexec_b64", "s_xor_saveexec_b64", "s_andn2_saveexec_b64", "s_orn2_saveexec_b64", "s_nand_saveexec_b64", "s_nor_saveexec_b64", "s_xnor_saveexec_b64", "s_andn1_saveexec_b64", "s_orn1_saveexec_b64", "s_and_saveexec_b32", "s_or_saveexec_b32", "s_xor_saveexec_b32", "s_andn2_saveexec_b32", "s_orn2_saveexec_b32", "s_nand_saveexec_b32", "s_nor_saveexec_b32", "s_xnor_saveexec_b32", "s_andn1_saveexec_b32", "s_orn1_saveexec_b32", "s_andn1_wrexec_b32", "s_andn2_wrexec_b32", "s_andn1_wrexec_b64", "s_andn2_wrexec_b64"] {
         s.skip(m, "SOP1", "wave-level EXEC/SCC semantics; covered by tests/exec.rs scalar_saveexec_lane_model");
     }
     for m in ["s_getpc_b64", "s_setpc_b64", "s_swappc_b64"] {

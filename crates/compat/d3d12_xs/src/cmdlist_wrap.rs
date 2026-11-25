@@ -30,7 +30,7 @@ const PAGE_READWRITE: u32 = 0x04;
 
 /// Number of Xbox vtable slots we materialize. Max observed call is Xbox slot 50
 /// (OMSetRenderTargets); 128 leaves generous headroom.
-const N: usize = 128;
+const N: usize = 256;
 static XBOX_VT: [AtomicUsize; N] = [const { AtomicUsize::new(0) }; N];
 static BUILT: AtomicBool = AtomicBool::new(false);
 static mut REAL_VT_PTR: *const usize = core::ptr::null();
@@ -39,6 +39,9 @@ pub(crate) unsafe fn real_list_slot(slot: usize) -> usize {
     if p.is_null() { 0 } else { unsafe { *p.add(slot) } }
 }
 static INSERTED_HITS: AtomicUsize = AtomicUsize::new(0);
+pub(crate) fn inserted_stub_addr() -> usize {
+    inserted_stub as usize
+}
 pub(crate) const CONSOLE_NULL_SLOT: usize = 66;
 
 pub(crate) unsafe fn real_slot_ptr(slot: usize) -> *mut usize {
@@ -432,6 +435,7 @@ pub fn apply(real_list: *mut c_void) {
             crate::cbv_raw::install_draw_check(&XBOX_VT);
             crate::passcap::install(&XBOX_VT);
             crate::gpuprof::install_ops(&XBOX_VT);
+            crate::cl_edition::install_cmdlist(&XBOX_VT);
             XBOX_VT[CONSOLE_NULL_SLOT].store(0, Ordering::Relaxed);
             record("d3d12_xs", "cmdlist.vtable",
                 &format!("built Xbox-layout cmdlist vtable from real {real_vt:p} (+4 shift at PC28)"));

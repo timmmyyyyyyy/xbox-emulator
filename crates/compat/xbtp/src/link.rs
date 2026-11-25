@@ -1014,7 +1014,11 @@ pub unsafe extern "C" fn XbtpLinkSetCompletionPort(h: *mut u8, port: HANDLE, key
     if h.is_null() {
         return LINK_E_NULL_HANDLE;
     }
-    if CreateIoCompletionPort(*at::<HANDLE>(h, OFF_DEVICE), port, key, threads) == port {
+    let device = *at::<HANDLE>(h, OFF_DEVICE);
+    if crate::link_dev::is_in_process(device) {
+        return crate::link_dev::set_completion_port(device, port, key);
+    }
+    if CreateIoCompletionPort(device, port, key, threads) == port {
         return S_OK;
     }
     hr_last_error()

@@ -76,6 +76,7 @@ static HANDLER: CaptureHandler = CaptureHandler { kind: 5, reserved: [0; 3], ctx
 fn from_title_builds_the_runtime_once_listens_on_0x1080_and_idles() {
     let dir = setup();
     assert!(bind_xbtp(XbtpFns {
+        session_io: || panic!("22000 must close an accepted link before resolving session I/O"),
         init_system: xbtp::link::XbtpLinkInitializeSystem,
         create: xbtp::link::XbtpLinkCreateHandle,
         listen: unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(*mut u8, *mut c_void, u16, *mut usize) -> i32>(xbtp::link::XbtpLinkListen as *const () as usize) },
@@ -229,6 +230,34 @@ fn from_title_builds_the_runtime_once_listens_on_0x1080_and_idles() {
         for &h in &hs {
             assert_eq!(WaitForSingleObject(h, 0), 0x102);
         }
+        let peer = xbtp::link::XbtpLinkCreateHandle();
+        assert!(!peer.is_null());
+        let address = [2, 0, 0x10, 0x80, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(xbtp::link::XbtpLinkConnect(peer, address.as_ptr(), 16, 5000), 0);
+        assert!(wait_until(|| rt.device.cancel_event() == 0));
+        let mut byte = 0;
+        let mut received = 1;
+        assert_eq!(xbtp::link::XbtpLinkRecv(peer, &mut byte, 1, &mut received, 0, core::ptr::null_mut()), 0);
+        assert_eq!(received, 0, "the 22000 worker closes the accepted link without a PIX session");
+        xbtp::link::XbtpLinkCloseHandle(peer);
+        assert_eq!(listener_refs(0x1080), 0);
+        assert!(!link_dev::listening(0x1080));
+        let replacement = xbtp::link::XbtpLinkCreateHandle();
+        assert!(!replacement.is_null());
+        let mut ready = core::ptr::null_mut();
+        assert_eq!(xbtp::link::XbtpLinkListen(replacement, core::ptr::null_mut(), 0x1080, &mut ready), 0);
+        xbtp::link::XbtpLinkCloseHandle(replacement);
+
+    }
+}
+
+#[test]
+fn worker_affinity_19041_uses_processor_six() {
+    for (process, expected) in [(0, 0x30), (0x3f, 0x30), (0x40, 0x60), (0x7f, 0x60), (0x80, 0x30), (0xff, 0x60), (0x10000, 0x30), (0x10040, 0x60)] {
+        assert_eq!(affinity_mask_for_build(19041, process), expected);
+        for build in [22000, 22621] {
+            assert_eq!(affinity_mask_for_build(build, process), affinity_mask(process));
+        }
     }
 }
 
@@ -241,7 +270,7 @@ fn affinity_and_layouts_follow_the_console() {
     assert_eq!(layout(22000), Some(LAYOUT_22000));
     assert_eq!(layout(22620), Some(LAYOUT_22000));
     assert_eq!(layout(22621), Some(LAYOUT_22621));
-    assert_eq!(layout(19041), None);
+    assert_eq!(layout(19041), Some(LAYOUT_19041));
     assert_eq!(TABLE_BYTES, 0x78);
     for l in [LAYOUT_22000, LAYOUT_22621] {
         assert!(l.slots.windows(2).all(|w| w[0] != w[1]));

@@ -170,16 +170,22 @@ fn global_windows_load_store_and_fault() {
 #[test]
 fn global_routing_and_refusals() {
     let isa = |w: &[u32]| -> Vec<u8> { w.iter().flat_map(|x| x.to_le_bytes()).collect() };
-    for (op, m) in [(0x08u32, "flat_load_ubyte"), (0x0b, "flat_load_sshort"), (0x18, "flat_store_byte"), (0x19, "flat_store_byte_d16_hi"), (0x1a, "flat_store_short"), (0x1b, "flat_store_short_d16_hi"), (0x1c, "flat_store_dword"), (0x1d, "flat_store_dwordx2"), (0x1e, "flat_store_dwordx4"), (0x1f, "flat_store_dwordx3")] {
+    for (op, m) in [(0x08u32, "flat_load_ubyte"), (0x0b, "flat_load_sshort"), (0x20, "flat_load_ubyte_d16"), (0x21, "flat_load_ubyte_d16_hi"), (0x22, "flat_load_sbyte_d16"), (0x23, "flat_load_sbyte_d16_hi"), (0x24, "flat_load_short_d16"), (0x25, "flat_load_short_d16_hi"), (0x18, "flat_store_byte"), (0x19, "flat_store_byte_d16_hi"), (0x1a, "flat_store_short"), (0x1b, "flat_store_short_d16_hi"), (0x1c, "flat_store_dword"), (0x1d, "flat_store_dwordx2"), (0x1e, "flat_store_dwordx4"), (0x1f, "flat_store_dwordx3")] {
         let got = tombox_xshader::rdna2::disassemble(&isa(&g(op, 2, 0, 1, 2, 20, 3))).into_iter().next().map(|i| i.mnemonic).unwrap_or_default();
         assert_eq!(got, m);
     }
     let mut p = Prog::new();
-    p.raw(&g(0x1c, 1, 0, 1, 2, 0x7d, 0));
+    p.raw(&g(0x30, 1, 0, 1, 2, 0x7d, 0));
     let mut w = p.w.clone();
     w.push(S_ENDPGM);
     let e = translate(&cs_extract(&w, 64)).err().unwrap_or_default();
     assert!(e.contains("scratch"), "{e}");
+    let mut p = Prog::new();
+    p.raw(&g(0x20, 1, 0, 1, 0, 0x7d, 24));
+    let mut w = p.w.clone();
+    w.push(S_ENDPGM);
+    let e = translate(&cs_extract(&w, 64)).err().unwrap_or_default();
+    assert!(e.contains("unsupported"), "{e}");
     let mut p = Prog::new();
     p.raw(&g(0x30, 2, 0, 1, 2, 20, 3));
     let mut w = p.w.clone();
@@ -333,6 +339,42 @@ fn flat_global_mem() {
         }
     }
     run_global_cases("flat_global", &cs);
+}
+
+#[test]
+fn flat_global_d16_loads() {
+    let w1_init: Vec<u8> = (0..W1.size as usize / 4).flat_map(|i| m1(i).to_le_bytes()).collect();
+    let le = |b: &[u8], a: usize| u32::from_le_bytes(b[a..a + 4].try_into().unwrap());
+    let words_of = |b: &[u8]| -> Vec<u32> { (0..b.len() / 4).map(|i| le(b, 4 * i)).collect() };
+    let keep = 0x5a5a_a5a5u32;
+    let lo = |v: u32| (keep & 0xffff_0000) | (v & 0xffff);
+    let hi = |v: u32| (keep & 0xffff) | (v << 16);
+    let mut cs = Vec::new();
+    type Ext = fn(u32) -> u32;
+    let d16: [(&'static str, u32, u32, u32, bool, Ext); 6] = [
+        ("flat_load_ubyte_d16", 0x20, 1, 17, false, |x| x & 0xff),
+        ("flat_load_ubyte_d16_hi", 0x21, 1, 18, true, |x| x & 0xff),
+        ("flat_load_sbyte_d16", 0x22, 1, 19, false, |x| x as u8 as i8 as i32 as u32),
+        ("flat_load_sbyte_d16_hi", 0x23, 1, 20, true, |x| x as u8 as i8 as i32 as u32),
+        ("flat_load_short_d16", 0x24, 2, 16, false, |x| x & 0xffff),
+        ("flat_load_short_d16_hi", 0x25, 2, 18, true, |x| x & 0xffff),
+    ];
+    for (m, opc, mul, add, hi_b, ext) in d16 {
+        for (seg, saddr, enc, eff) in MODES {
+            let op = g(opc, seg, enc, 20, 0, saddr, 24);
+            let mut body = vec![vop1(1, 24, LIT), keep];
+            body.extend_from_slice(&op);
+            body.extend_from_slice(&g(0x1c, 2, 0, 1, 24, 20, 0));
+            let mut w0 = Vec::new();
+            for t in 0..64u32 {
+                let a = (mul * t + add) as usize;
+                let v = ext(le(&w1_init, a));
+                w0.push((t as usize, if hi_b { hi(v) } else { lo(v) }));
+            }
+            cs.push(GCase { m, op: op.to_vec(), words: gprog(mul, add, eff, &body), w0, w1: words_of(&w1_init) });
+        }
+    }
+    run_global_cases("flat_global_d16", &cs);
 }
 
 #[test]

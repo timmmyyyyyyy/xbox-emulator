@@ -675,7 +675,7 @@ fn isa_sweep() {
     assert!(failed.is_empty(), "{} mnemonics failing (see table above)", failed.len());
 }
 
-const WARP_KNOWN: &[&str] = &["v_ceil_f64", "v_floor_f64", "v_trunc_f64", "v_rndne_f64", "v_fract_f64", "v_cvt_f64_i32", "v_cvt_u32_f64", "v_fma_f64", "v_div_fmas_f64", "v_madak_f32", "v_fmaak_f16"];
+const WARP_KNOWN: &[&str] = &["v_rndne_f64", "v_cvt_f64_i32", "v_cvt_u32_f64", "v_fma_f64", "v_div_fmas_f64"];
 
 #[test]
 fn isa_sweep_hlsl_probe() {

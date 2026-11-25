@@ -368,6 +368,10 @@ fn second_batch_scalar_ops() {
         ("s_bitset1_b64", vec![sop1(0x1e, 4, 2), to_v0, to_v1], vec!["= s5 | ("]),
         ("s_orn1_saveexec_b64", vec![sop1(0x38, 4, 0), to_v0], vec!["(~s0 | exec_lo)"]),
         ("s_orn2_saveexec_b32", vec![sop1(0x40, 4, 0), to_v0], vec!["(s0 | ~exec_lo)"]),
+        ("s_nand_saveexec_b32", vec![sop1(0x41, 4, 0), to_v0], vec!["(~(s0 & exec_lo)) & 1u"]),
+        ("s_xnor_saveexec_b64", vec![sop1(0x2b, 4, 0), to_v0, to_v1], vec!["(~(s0 ^ exec_lo)) & 1u", "s5 = 0u"]),
+        ("s_andn1_wrexec_b32", vec![sop1(0x46, 4, 0), to_v0], vec!["(~s0 & exec_lo) & 1u", "exec_lo = t"]),
+        ("s_andn2_wrexec_b64", vec![sop1(0x3a, 4, 0), to_v0, to_v1], vec!["(s0 & ~exec_lo) & 1u", "s5 = 0u"]),
         ("s_bitcmp1_b64", vec![0xbf0f_0200, to_v0], vec!["(s2) & 63u) >= 32u ? (s1 >>"]),
         ("s_bitcmp0_b64", vec![0xbf0e_0200, to_v0], vec!["& 1u) == 0u)"]),
         ("s_sleep / s_setprio / s_icache_inv", vec![0xbf8e_0001, 0xbf8f_0000, 0xbf93_0000, 0xbf8b_0000, 0xbf94_0000, 0xbf95_0000, to_v0], vec![]),
@@ -484,6 +488,9 @@ fn double_precision_ops() {
         ("v_cmp_class_f64", vec![vopc(0xa8, v(0), 3), vop1(1, 4, 106)], "tb_cmp_class64(v0, v1, v3)"),
         ("v_cmpx_class_f32", vec![vopc(0x98, v(1), 3), vop1(1, 4, v(1))], "tb_cmp_class(v1, v3)"),
         ("v_msad_u8", o(0x171, [v(1), v(2), v(3)]), "((((v2 >> 0u) & 0xffu) == 0u) ? 0u :"),
+        ("v_qsad_pk_u16_u8", o(0x172, [v(0), v(1), v(2)]), "0xffffu) | (("),
+        ("v_mqsad_pk_u16_u8", o(0x173, [v(0), v(1), v(2)]), "== 0u) ? 0u : (max("),
+        ("v_mqsad_u32_u8", o(0x175, [v(0), v(1), v(2)]), "s3 = v5;"),
         ("v_mullit_f32", o(0x150, [v(1), v(2), v(3)]), "-3.402823466e+38"),
     ];
     for (label, mut body, expect) in cases {
@@ -702,5 +709,41 @@ fn vop3p_int16_refuses_modifiers_without_defined_integer_semantics() {
     }
     for op in [0x02, 0x03, 0x07, 0x0a, 0x0b, 0x0d] {
         check("clamp", &program(&vop3p(op, 0, [v(1), v(2), 0], 7, 0, true)), None, &[]);
+    }
+}
+
+#[test]
+fn packed_multi_sad_refuses_clamp() {
+    for op in [0x172u32, 0x173] {
+        let mut w = vop3(op, 0, [v(1), v(2), v(4)], 0, 0);
+        w[0] |= 1 << 15;
+        let err = translate(&shader(&program(&w), None)).err().unwrap_or_default();
+        assert!(err.contains("CLAMP on a packed 16-bit multi-SAD is not lowered"), "op {op:#x}: {err}");
+    }
+    let mut w = vop3(0x175, 0, [v(1), v(2), v(4)], 0, 0);
+    w[0] |= 1 << 15;
+    check("v_mqsad_u32_u8 clamp", &program(&w), None, &[]);
+}
+
+#[test]
+fn f32_div_helpers() {
+    let fixup = vop3(0x15f, 0, [v(1), v(2), v(3)], 0, 0).to_vec();
+    let fmas = vop3(0x16f, 0, [v(1), v(2), v(3)], 0, 0).to_vec();
+    let mut scale = vop3(0x16d, 0, [v(1), v(2), v(3)], 0, 0);
+    scale[0] |= 106 << 8;
+    check("v_div_fixup_f32", &program(&fixup), None, &["tb_div_fixup32(asfloat(v1), asfloat(v2), asfloat(v3))"]);
+    check("v_div_fmas_f32", &program(&fmas), None, &["tb_div_fmas32(asfloat(v1), asfloat(v2), asfloat(v3), vcc_lo)"]);
+    check("v_div_scale_f32", &program(&scale), None, &["tb_div_scale32(asfloat(v1), asfloat(v2), asfloat(v3), t", "vcc_lo = (((exec_lo & 1u) != 0u) ? t"]);
+}
+
+#[test]
+fn f32_division_helpers_refuse_a_shader_written_mode() {
+    let set_round = [0xba80_1801u32, 1];
+    for op in [0x16du32, 0x16f, 0x15f] {
+        let mut body = set_round.to_vec();
+        body.extend_from_slice(&vop3(op, 0, [v(1), v(2), v(3)], 0, 0));
+        let err = translate(&shader(&program(&body), None)).err().unwrap_or_default();
+        assert!(err.contains("under a shader-written single-precision MODE is not lowered"), "op {op:#x}: {err}");
+        check("default MODE", &program(&vop3(op, 0, [v(1), v(2), v(3)], 0, 0)), None, &[]);
     }
 }

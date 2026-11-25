@@ -81,6 +81,37 @@ fn send_entries(id: u64, entries: &[(&[u8], u32)]) -> (i32, Call) {
 }
 
 #[test]
+fn counter_group_reads_the_four_19041_sfr_values() {
+    use console_sandbox::xvcsys::{IOCTL_SFR_COUNTER_GROUP, IOCTL_SFR_UPDATE};
+    if std::env::var_os("XVC_COUNTER_GROUP_TEST_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "counter_group_reads_the_four_19041_sfr_values"])
+            .env("XVC_COUNTER_GROUP_TEST_CHILD", "1")
+            .env("TOMBOX_CONSOLE_OSBUILD", "19041")
+            .status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    let mut out = [0xa5; 35];
+    assert_eq!(sync_fail(IOCTL_SFR_COUNTER_GROUP, &[], &mut out[1..33]), xvcmgmt::STATUS_INVALID_PARAMETER);
+    assert_eq!(out, [0xa5; 35]);
+    let mut updates = Vec::new();
+    for i in 0..4u32 {
+        updates.extend((0x28 + i).to_le_bytes());
+        updates.extend(0u32.to_le_bytes());
+        updates.extend((0x1234_5678_0000_0000u64 + u64::from(i)).to_le_bytes());
+    }
+    let mut call = Call::new();
+    assert_eq!(call.run(IOCTL_SFR_UPDATE, &updates, &mut []), 0);
+    assert_eq!(call.run(IOCTL_SFR_COUNTER_GROUP, &[], &mut out[1..]), 0);
+    assert_eq!(call.wait(0), Some((0, 33)));
+    for (i, bytes) in out[1..33].chunks_exact(8).enumerate() {
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 0x1234_5678_0000_0000 + i as u64);
+    }
+    assert_eq!((out[0], out[33], out[34]), (0xa5, 0, 0xa5));
+}
+
+#[test]
 fn driver_size_checks_and_status_codes() {
     setup();
     assert_eq!(sync_fail(xvcmgmt::IOCTL_CREATE, &[0; 0x20], &mut [0; 7]), xvcmgmt::STATUS_INVALID_PARAMETER, "CREATE out < 8");

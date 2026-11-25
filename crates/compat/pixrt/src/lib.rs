@@ -9,6 +9,8 @@ pub mod etw;
 pub mod runtime;
 #[cfg(not(pixrt_classic))]
 pub mod session;
+#[cfg(not(pixrt_classic))]
+pub mod transport_stream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 

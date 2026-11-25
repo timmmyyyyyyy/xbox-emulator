@@ -13,6 +13,7 @@ const IID_ROOT_SIGNATURE: Guid = Guid { d1: 0xc54a_6b66, d2: 0x72df, d3: 0x4ee8,
 const IID_PSO: Guid = Guid { d1: 0x765a_30f3, d2: 0xf624, d3: 0x4c6f, d4: [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45] };
 const IID_DESC_HEAP: Guid = Guid { d1: 0x8efb_471d, d2: 0x616c, d3: 0x4f49, d4: [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51] };
 const IID_FACTORY4: Guid = Guid { d1: 0x1bc6_ea02, d2: 0xef36, d3: 0x464f, d4: [0xbf, 0x0c, 0x21, 0xca, 0x39, 0xe5, 0x16, 0x8a] };
+const IID_DEVICE2: Guid = Guid { d1: 0x30ba_a41e, d2: 0xb15b, d3: 0x475c, d4: [0xa0, 0xbb, 0x1a, 0xf5, 0xc5, 0xb6, 0x43, 0x28] };
 const IID_ADAPTER: Guid = Guid { d1: 0x2411_e7e1, d2: 0x12ac, d3: 0x4ccf, d4: [0xbd, 0x14, 0x97, 0x98, 0xe8, 0x53, 0x4d, 0xc0] };
 
 const W: u32 = 64;
@@ -382,10 +383,133 @@ fn warp_rectlist_topology_17_covers_all_four_corners() {
         defaults[X_DEPTH_BIAS] = BIAS_SENTINEL;
         crate::cl2_state::install(&k.vt, &defaults);
         let p = pso(&k);
+        let bad = exercise(&mut k, p);
+        crate::cl2_state::test_restore(saved);
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+}
+
+#[test]
+#[ignore = "needs D3D12 WARP: cargo test -p d3d12_xs --lib warp_rectlist -- --ignored"]
+fn warp_rectlist_topology_17_on_a_stream_built_pso_covers_all_four_corners() {
+    if !gpu_free() {
+        return;
+    }
+    if !tombox_xshader::dxc::available() {
+        println!("DXC not available: WARP rect-list stream test not run");
+        return;
+    }
+    let _g = crate::cl2_state::TEST_PREV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        let mut k = kit();
+        let saved = crate::cl2_state::test_install(&k.vt);
+        let mut defaults = vec![0usize; 128];
+        defaults[X_DEPTH_BIAS] = BIAS_SENTINEL;
+        crate::cl2_state::install(&k.vt, &defaults);
+        let p = stream_pso(&k);
+        let bad = exercise(&mut k, p);
+        crate::cl2_state::test_restore(saved);
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+}
+
+#[test]
+#[ignore = "needs D3D12 WARP: cargo test -p d3d12_xs --lib warp_rectlist -- --ignored"]
+fn warp_rectlist_compute_pso_bound_under_topology_17_is_skipped_quietly() {
+    if !gpu_free() {
+        return;
+    }
+    if !tombox_xshader::dxc::available() {
+        println!("DXC not available: WARP rect-list compute test not run");
+        return;
+    }
+    let _g = crate::cl2_state::TEST_PREV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        let mut k = kit();
+        let saved = crate::cl2_state::test_install(&k.vt);
+        let mut defaults = vec![0usize; 128];
+        defaults[X_DEPTH_BIAS] = BIAS_SENTINEL;
+        crate::cl2_state::install(&k.vt, &defaults);
+        let known = compute_pso(&k, true);
+        let unknown = compute_pso(&k, false);
+        let l = k.list as *mut c_void;
+        crate::cl2_state::on_new_list(l);
+        let topo: unsafe extern "system" fn(*mut c_void, u32) = x(&k, X_TOPOLOGY);
+        topo(l, 17);
+        let set_pso: unsafe extern "system" fn(*mut c_void, *mut c_void) = x(&k, X_PSO);
+        set_pso(l, known as *mut c_void);
+        set_pso(l, unknown as *mut c_void);
+        let mut bad = Vec::new();
+        if crate::rectlist::was_refused(known as u64) {
+            bad.push(format!("registered compute PSO {known:#x} was reported as an unknown rect-list pipeline"));
+        }
+        if !crate::rectlist::was_refused(unknown as u64) {
+            bad.push(format!("unregistered PSO {unknown:#x} was skipped instead of refused"));
+        }
+        let p = pso(&k);
+        let flat = [-0.5f32, 0.5, 0.5, -0.5, 1.0, 1.0, 1.0, 0.0];
+        let img = run(&mut k, p, &[Draw { topology: 17, pso_after_topology: true, c: flat, ..Draw::default() }]);
+        check_rect(&img, &flat, "graphics rect after a compute PSO under topology 17", &mut bad);
+        crate::cl2_state::test_restore(saved);
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+}
+
+unsafe fn compute_pso(k: &Kit, register: bool) -> usize {
+    let cs = tombox_xshader::dxc::compile("[RootSignature(\"RootFlags(0)\")]\n[numthreads(1, 1, 1)]\nvoid main() {}\n", "cs_6_0").expect("cs");
+    let mut rs: *mut c_void = core::ptr::null_mut();
+    assert!(unsafe { vc!(k.dev, 16, fn(u32, *const u8, usize, *const Guid, *mut *mut c_void) -> i32, 0, cs.as_ptr(), cs.len(), &IID_ROOT_SIGNATURE, &mut rs) } >= 0);
+    let mut d = vec![0u8; crate::pso_serial::COMPUTE_DESC_SIZE];
+    d[0..8].copy_from_slice(&(rs as u64).to_le_bytes());
+    d[0x08..0x10].copy_from_slice(&(cs.as_ptr() as u64).to_le_bytes());
+    d[0x10..0x18].copy_from_slice(&(cs.len() as u64).to_le_bytes());
+    let mut p: *mut c_void = core::ptr::null_mut();
+    let hr = unsafe { vc!(k.dev, 11, fn(*const u8, *const Guid, *mut *mut c_void) -> i32, d.as_ptr(), &IID_PSO, &mut p) };
+    assert!(hr >= 0 && !p.is_null(), "CreateComputePipelineState hr={hr:#010x}");
+    if register {
+        crate::device_x::register_compute(p, &d, std::sync::Arc::new(cs));
+    }
+    p as usize
+}
+
+unsafe fn stream_pso(k: &Kit) -> usize {
+    use crate::dbcount::append_sub;
+    let shaders = vec![std::sync::Arc::new(k.vs.clone()), std::sync::Arc::new(k.ps.clone())];
+    let code = |c: &[u8]| [(c.as_ptr() as u64).to_le_bytes(), (c.len() as u64).to_le_bytes()].concat();
+    let mut rast = [0u8; 44];
+    put(&mut rast, 0, 3);
+    put(&mut rast, 4, 1);
+    put(&mut rast, 24, 1);
+    let mut rtf = [0u8; 36];
+    put(&mut rtf, 0, FMT_RGBA32F);
+    put(&mut rtf, 32, 1);
+    let mut s = Vec::new();
+    let mut subs = Vec::new();
+    append_sub(&mut s, &mut subs, 0, &(k.rs as u64).to_le_bytes());
+    append_sub(&mut s, &mut subs, 1, &code(&shaders[0]));
+    append_sub(&mut s, &mut subs, 2, &code(&shaders[1]));
+    append_sub(&mut s, &mut subs, 10, &rast);
+    append_sub(&mut s, &mut subs, 11, &[0u8; 52]);
+    append_sub(&mut s, &mut subs, 14, &3u32.to_le_bytes());
+    append_sub(&mut s, &mut subs, 15, &rtf);
+    let mut d2: *mut c_void = core::ptr::null_mut();
+    assert!(unsafe { vc!(k.dev, 0, fn(*const Guid, *mut *mut c_void) -> i32, &IID_DEVICE2, &mut d2) } >= 0 && !d2.is_null());
+    let desc = [s.len() as u64, s.as_ptr() as u64];
+    let mut p: *mut c_void = core::ptr::null_mut();
+    let hr = unsafe { vc!(d2, 47, fn(*const [u64; 2], *const Guid, *mut *mut c_void) -> i32, &desc, &IID_PSO, &mut p) };
+    unsafe { vc!(d2, 2, fn() -> u32) };
+    assert!(hr >= 0 && !p.is_null(), "CreatePipelineState hr={hr:#010x}");
+    crate::dbcount::note_stream_pso(p as usize, &s, &shaders);
+    assert!(crate::device_wrap::gfx_pso_desc(p as usize).is_none());
+    p as usize
+}
+
+unsafe fn exercise(k: &mut Kit, p: usize) -> Vec<String> {
+    unsafe {
         let flat = [-0.5f32, 0.5, 0.5, -0.5, 1.0, 1.0, 1.0, 0.0];
         let persp = [-0.5f32, 0.5, 0.5, -0.5, 2.0, 1.5, 1.5, 0.0];
         let mut bad = Vec::new();
-        let img = run(&mut k, p, &[Draw { topology: 17, c: flat, ..Draw::default() }]);
+        let img = run(k, p, &[Draw { topology: 17, c: flat, ..Draw::default() }]);
         check_rect(&img, &flat, "Draw w=1", &mut bad);
         for (px, py, want) in [(16u32, 16u32, [0.0f32, 0.0]), (16, 47, [0.0, 1.0]), (47, 16, [1.0, 0.0]), (47, 47, [1.0, 1.0])] {
             let g = img[(py * W + px) as usize];
@@ -393,13 +517,13 @@ fn warp_rectlist_topology_17_covers_all_four_corners() {
                 bad.push(format!("corner ({px},{py}) = {g:?}, want uv near {want:?}"));
             }
         }
-        let img = run(&mut k, p, &[Draw { topology: 17, indexed: true, c: persp, ..Draw::default() }]);
+        let img = run(k, p, &[Draw { topology: 17, indexed: true, c: persp, ..Draw::default() }]);
         check_rect(&img, &persp, "DrawIndexed perspective w=(2,1.5,1.5)", &mut bad);
-        let img = run(&mut k, p, &[Draw { topology: 17, pso_after_topology: true, c: flat, ..Draw::default() }]);
+        let img = run(k, p, &[Draw { topology: 17, pso_after_topology: true, c: flat, ..Draw::default() }]);
         check_rect(&img, &flat, "PSO set after topology 17", &mut bad);
-        let img = run(&mut k, p, &[Draw { topology: 17, depth_bias: true, c: persp, ..Draw::default() }]);
+        let img = run(k, p, &[Draw { topology: 17, depth_bias: true, c: persp, ..Draw::default() }]);
         check_rect(&img, &persp, "RSSetDepthBiasX while topology 17", &mut bad);
-        let img = run(&mut k, p, &[Draw { topology: 17, c: [-1.0, 1.0, -0.5, 0.5, 1.0, 1.0, 1.0, 0.0], ..Draw::default() }, Draw { topology: 4, c: flat, ..Draw::default() }]);
+        let img = run(k, p, &[Draw { topology: 17, c: [-1.0, 1.0, -0.5, 0.5, 1.0, 1.0, 1.0, 0.0], ..Draw::default() }, Draw { topology: 4, c: flat, ..Draw::default() }]);
         let at = |px: u32, py: u32| img[(py * W + px) as usize];
         if at(0, 0)[3] != 1.0 || at(15, 15)[3] != 1.0 {
             bad.push(format!("first rect lost corners: {:?} {:?}", at(0, 0), at(15, 15)));
@@ -410,7 +534,6 @@ fn warp_rectlist_topology_17_covers_all_four_corners() {
         if at(46, 46) != [0.0; 4] {
             bad.push(format!("topology-4 draw after a rect still drew a fourth corner: {:?}", at(46, 46)));
         }
-        crate::cl2_state::test_restore(saved);
-        assert!(bad.is_empty(), "{}", bad.join("\n"));
+        bad
     }
 }

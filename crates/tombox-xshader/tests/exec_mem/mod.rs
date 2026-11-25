@@ -4,6 +4,7 @@ use tombox_xshader::meta::{RootParam, RootParamKind, RootRange, RootSig};
 
 mod bvh;
 mod branch;
+mod cache_inv;
 mod cfg_fuzz;
 mod ds;
 mod gds;
@@ -14,11 +15,14 @@ mod mimg;
 mod mimg_rdna2;
 mod mtbuf;
 mod mtbuf_hw;
+mod mubuf_wide;
 mod trans16;
 mod trans32;
 mod rootmem;
 mod smem_nr;
+mod sop1_dst;
 mod user_data;
+mod vfetch;
 
 pub const R32G32B32A32_FLOAT: u32 = 2;
 pub const R32G32B32A32_UINT: u32 = 3;
@@ -523,9 +527,28 @@ fn mem_device_features() {
 pub const CS_BYTES: u64 = 4096;
 
 pub fn cs_extract(words: &[u32], threads: u32) -> ShaderExtract {
+    cs_extract_fssm(words, threads, &[])
+}
+
+pub fn cs_fssm(compute_pgm_rsrc2: u32) -> Vec<u8> {
+    cs_fssm_sub(5, 0x130, compute_pgm_rsrc2)
+}
+
+pub fn cs_fssm_sub(sub_version: u32, at: usize, compute_pgm_rsrc2: u32) -> Vec<u8> {
+    let mut b = vec![0u8; 0x13c];
+    b[0x10..0x14].copy_from_slice(&sub_version.to_le_bytes());
+    b[at..at + 4].copy_from_slice(&compute_pgm_rsrc2.to_le_bytes());
+    b
+}
+
+pub fn cs_extract_fssm(words: &[u32], threads: u32, fssm: &[u8]) -> ShaderExtract {
     let mut ex = shader_root(words, RootSig { version: 2, flags: 1, params: vec![table(1, 8)], num_static_samplers: 0, static_samplers: Vec::new() });
     ex.stage = Stage::Compute;
     ex.isa_preamble = [0, threads, 1, 1];
+    ex.fssm = fssm.to_vec();
+    if !fssm.is_empty() {
+        ex.isa_offset_in_fssm = fssm.len() + 16;
+    }
     ex.output_sig = vec![];
     ex.has_output_sig = false;
     ex.has_input_sig = false;
@@ -533,7 +556,11 @@ pub fn cs_extract(words: &[u32], threads: u32) -> ShaderExtract {
 }
 
 pub fn exec_cs(words: &[u32], threads: u32, init: &[u32]) -> Result<Vec<u32>, String> {
-    let ex = cs_extract(words, threads);
+    exec_cs_fssm(words, threads, init, &[])
+}
+
+pub fn exec_cs_fssm(words: &[u32], threads: u32, init: &[u32], fssm: &[u8]) -> Result<Vec<u32>, String> {
+    let ex = cs_extract_fssm(words, threads, fssm);
     let t = translate(&ex)?;
     let code = dxc::compile(&t.hlsl, &dxc::profile_for(t.profile)).map_err(|e| format!("dxc: {e}\n{}", t.hlsl))?;
     let m = CTX.get_or_init(|| Mutex::new(unsafe { ctx_new() }));
@@ -616,6 +643,10 @@ pub struct CsCase {
 }
 
 pub fn run_cs_cases(group: &str, cs: &[CsCase]) {
+    run_cs_cases_fssm(group, cs, &[])
+}
+
+pub fn run_cs_cases_fssm(group: &str, cs: &[CsCase], fssm: &[u8]) {
     let mut fails = Vec::new();
     let mut all: std::collections::BTreeSet<&str> = Default::default();
     let mut bad: std::collections::BTreeSet<&str> = Default::default();
@@ -631,11 +662,11 @@ pub fn run_cs_cases(group: &str, cs: &[CsCase]) {
         }
         let tag = if rtw.is_some() { runtime += 1; " (runtime inputs)" } else { "" };
         let words = rtw.as_deref().unwrap_or(&c.words);
-        match exec_cs(words, c.threads, &c.init) {
+        match exec_cs_fssm(words, c.threads, &c.init, fssm) {
             Ok(o) => {
                 let wrong: Vec<String> = c.mem.iter().filter(|&&(k, w)| o[k] != w).take(6).map(|&(k, w)| format!("[{k}] {:08x} want {w:08x}", o[k])).collect();
                 if !wrong.is_empty() {
-                    let h = translate(&cs_extract(words, c.threads)).map(|t| t.hlsl).unwrap_or_default();
+                    let h = translate(&cs_extract_fssm(words, c.threads, fssm)).map(|t| t.hlsl).unwrap_or_default();
                     let body: String = h.lines().filter(|l| l.starts_with("    ") && !l.contains("// 0x")).collect::<Vec<_>>().join("\n");
                     fails.push(format!("#{i} {}{tag}: {}\n{body}", c.m, wrong.join(", ")));
                     bad.insert(c.m);

@@ -81,6 +81,8 @@ extern "system" {
     fn GetVersion() -> u32;
     fn GetCurrentProcess() -> usize;
     fn K32GetProcessImageFileNameA(p: usize, buf: *mut u8, size: u32) -> u32;
+    fn AreFileApisANSI() -> i32;
+    fn MultiByteToWideChar(page: u32, flags: u32, input: *const u8, bytes: i32, output: *mut u16, capacity: i32) -> i32;
     fn LoadLibraryExW(n: *const u16, f: usize, flags: u32) -> usize;
     fn GetProcAddress(m: usize, n: *const u8) -> usize;
     fn OutputDebugStringW(s: *const u16);
@@ -113,11 +115,29 @@ pub fn image_tail(image: &[u8]) -> Option<Vec<u8>> {
     Some(tail.to_vec())
 }
 
+fn marker_path(image: &[u8], code_page: u32) -> Option<String> {
+    let tail = image_tail(image)?;
+    let mut wide = [0u16; GATE_BUFFER];
+    let count = unsafe { MultiByteToWideChar(code_page, 0, tail.as_ptr(), tail.len() as i32, wide.as_mut_ptr(), wide.len() as i32) };
+    if count == 0 {
+        return None;
+    }
+    Some(format!("{PIX_GATE_DIR}{}", String::from_utf16(&wide[..count as usize]).ok()?))
+}
+
+#[cfg(test)]
+#[test]
+fn marker_uses_the_file_api_code_page() {
+    assert_eq!(marker_path(b"\\Device\\Caf\xe9.exe", 1252).as_deref(), Some("c:\\pix\\Café.exe"));
+    assert_eq!(marker_path(b"\\Device\\Caf\x82.exe", 437).as_deref(), Some("c:\\pix\\Café.exe"));
+    assert_eq!(marker_path("\\Device\\Café.exe".as_bytes(), 65001).as_deref(), Some("c:\\pix\\Café.exe"));
+}
+
 pub fn gate_path() -> Option<String> {
     let mut buf = [0u8; GATE_BUFFER];
     let n = unsafe { K32GetProcessImageFileNameA(GetCurrentProcess(), buf.as_mut_ptr(), GATE_BUFFER as u32) } as usize;
-    let tail = image_tail(&buf[..n.min(GATE_BUFFER)])?;
-    Some(format!("{PIX_GATE_DIR}{}", String::from_utf8_lossy(&tail)))
+    let file_code_page = if unsafe { AreFileApisANSI() } != 0 { 0 } else { 1 };
+    marker_path(&buf[..n.min(GATE_BUFFER)], file_code_page)
 }
 
 pub fn gate_host_path() -> Option<std::path::PathBuf> {

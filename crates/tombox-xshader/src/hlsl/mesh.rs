@@ -256,6 +256,8 @@ impl<'a> Emitter<'a> {
             let parts = [format!("{expr} & 0x1ffu"), format!("({expr} >> 10) & 0x1ffu"), format!("({expr} >> 20) & 0x1ffu")];
             parts[..nidx].join(", ")
         };
+        let tg = n.div_ceil(w);
+        let wave_info = |gi: &str| format!("s3 = {:#x}u | (({gi} / {w}u) << 24) | (min({w}u, {n}u - ({gi} & {:#x}u)) * 0x101u);", tg << 28, !(w - 1));
         if passes == 1 {
             let _ = writeln!(h, "    uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
             let _ = writeln!(h, "{}", self.reg_decls());
@@ -272,7 +274,7 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(h, "    if (gi == 0u) tb_mscnt = 0u;");
                 let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
             }
-            let _ = writeln!(h, "    v5 = gid.x * {n}u + gi; s3 = (gi / {w}u) << 24;");
+            let _ = writeln!(h, "    v5 = gid.x * {n}u + gi; {}", wave_info("gi"));
             if pl.is_some() {
                 h.push_str(&self.amp_ms_prologue(m.payload_bytes));
             }
@@ -280,7 +282,7 @@ impl<'a> Emitter<'a> {
             if !local_counts {
                 let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
             }
-            let _ = writeln!(h, "    uint tb_nv = tb_mscnt & 0xfffu, tb_np = (tb_mscnt >> 12) & 0xfffu;");
+            let _ = writeln!(h, "    uint tb_nv = tb_mscnt & 0x3ffu, tb_np = (tb_mscnt >> 12) & 0x7ffu;");
             let _ = writeln!(h, "    SetMeshOutputCounts(tb_nv, tb_np);");
             let _ = writeln!(h, "    if (gi < tb_nv) verts[gi] = o;");
             if has_prim_attrs {
@@ -310,7 +312,7 @@ impl<'a> Emitter<'a> {
             } else {
                 let _ = writeln!(h, "        SOut o = (SOut)0; uint tb_prim = 0u;");
             }
-            let _ = writeln!(h, "        v5 = gid.x * {n}u + tb_gi; s3 = (tb_gi / {w}u) << 24;");
+            let _ = writeln!(h, "        v5 = gid.x * {n}u + tb_gi; {}", wave_info("tb_gi"));
             if pl.is_some() {
                 h.push_str(&self.amp_ms_prologue(m.payload_bytes));
             }
@@ -323,7 +325,7 @@ impl<'a> Emitter<'a> {
             if !local_counts {
                 let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
             }
-            let _ = writeln!(h, "    uint tb_nv = tb_mscnt & 0xfffu, tb_np = (tb_mscnt >> 12) & 0xfffu;");
+            let _ = writeln!(h, "    uint tb_nv = tb_mscnt & 0x3ffu, tb_np = (tb_mscnt >> 12) & 0x7ffu;");
             let _ = writeln!(h, "    SetMeshOutputCounts(tb_nv, tb_np);");
             let _ = writeln!(h, "    if (gi < tb_nv) verts[gi] = tb_vo[0];");
             if mv > pc_n {

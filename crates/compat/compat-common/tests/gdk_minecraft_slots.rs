@@ -1,4 +1,4 @@
-use compat_common::gdk::{self, package, system, ui, user, xasync, Guid};
+﻿use compat_common::gdk::{self, package, system, ui, user, xasync, Guid};
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -61,8 +61,8 @@ fn shared_vtable_iids_reuse_the_same_slot_functions() {
         let size_f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut u32) -> i32 = core::mem::transmute(size_f);
         let mut idle = Box::new(Block { queue: 0, context: 0, callback: 0, internal: [0; 32] });
         let mut sz = 0x5a5a_5a5au32;
-        assert!(size_f(uo, &mut *idle as *mut Block as *mut c_void, &mut sz) < 0);
-        assert_eq!(sz, 0x5a5a_5a5a);
+        assert_eq!(size_f(uo, &mut *idle as *mut Block as *mut c_void, &mut sz), 0);
+        assert_eq!(sz, 0);
         assert_eq!(method(user::CLSID, user::IID_V1, 13).1, method(user::CLSID, user::IID_V2, 13).1);
         let (o, guest) = method(user::CLSID, user::IID_V1, 13);
         let guest: unsafe extern "system" fn(*mut c_void, usize, *mut bool) -> i32 = core::mem::transmute(guest);
@@ -207,7 +207,7 @@ unsafe extern "system" fn monitor_composite(ctx: *mut c_void, q: usize, port: u3
 }
 
 #[test]
-fn task_queue_monitors_belong_to_the_queue_not_the_shared_port() {
+fn task_queue_monitors_report_each_queue_on_a_shared_port() {
     env();
     unsafe {
         let x = xasync::XASYNC;
@@ -230,32 +230,37 @@ fn task_queue_monitors_belong_to_the_queue_not_the_shared_port() {
         assert_eq!(composite(o, cp, wp, &mut c), 0);
         assert_ne!(c, a);
 
+        let take = || {
+            let mut v = std::mem::take(&mut *SEEN_COMPOSITE.lock().unwrap());
+            v.sort();
+            v
+        };
         let mut ta = 0u64;
         assert_eq!(register(o, a, 21 as *mut c_void, Some(monitor_composite), &mut ta), 0);
         assert_eq!(submit(o, c, 0, core::ptr::null_mut(), quiet_task), 0);
-        assert!(SEEN_COMPOSITE.lock().unwrap().is_empty());
+        assert_eq!(take(), vec![(21, a, 1)]);
         assert!(dispatch(o, a, 1, 0));
 
         let mut tc = 0u64;
         assert_eq!(register(o, c, 22 as *mut c_void, Some(monitor_composite), &mut tc), 0);
         assert_eq!(submit(o, c, 0, core::ptr::null_mut(), quiet_task), 0);
+        assert_eq!(take(), vec![(21, a, 1), (22, c, 0)]);
         assert_eq!(submit(o, c, 1, core::ptr::null_mut(), quiet_task), 0);
-        assert_eq!(*SEEN_COMPOSITE.lock().unwrap(), vec![(22, c, 0), (22, c, 1)]);
+        assert_eq!(take(), vec![(21, a, 0), (22, c, 1)]);
         assert_eq!(submit(o, a, 0, core::ptr::null_mut(), quiet_task), 0);
-        assert_eq!(SEEN_COMPOSITE.lock().unwrap()[2], (21, a, 0));
-        assert_eq!(SEEN_COMPOSITE.lock().unwrap().len(), 3);
+        assert_eq!(take(), vec![(21, a, 0), (22, c, 1)]);
         assert!(dispatch(o, a, 1, 0));
         assert!(dispatch(o, a, 0, 0));
         assert!(dispatch(o, a, 0, 0));
 
         unregister(o, a, tc);
         assert_eq!(submit(o, c, 0, core::ptr::null_mut(), quiet_task), 0);
-        assert_eq!(SEEN_COMPOSITE.lock().unwrap().len(), 4);
+        assert!(take().contains(&(22, c, 0)));
         unregister(o, c, tc);
         unregister(o, a, ta);
         assert_eq!(submit(o, c, 0, core::ptr::null_mut(), quiet_task), 0);
         assert_eq!(submit(o, a, 0, core::ptr::null_mut(), quiet_task), 0);
-        assert_eq!(SEEN_COMPOSITE.lock().unwrap().len(), 4);
+        assert!(take().is_empty());
         close(o, c);
         close(o, a);
     }

@@ -326,3 +326,69 @@ NaN rules, v_min_f32 / v_max_f32: in IEEE mode 0 a NaN operand is ignored when t
 number, and two NaNs give src0 unchanged. In IEEE mode 1 a signalling NaN wins and is quieted (src0
 first); otherwise a quiet NaN is ignored when the other operand is a number, and two quiet NaNs give
 src0.
+
+Colour export and blend probe (cb_probe.cpp, cb_probe.vert, cb_probe.frag, cb_probe.py)
+--------------------------------------------------------------------------------------
+
+A Vulkan program, not raw ISA: it draws one row of pixels whose fragment shader writes four f32
+bit patterns from a storage buffer, into RGBA16F, B10G11R11_UFLOAT, RGBA32F and R16F targets, with
+blending off, ONE/ZERO ADD, ONE/ONE ADD, MIN and MAX. A first unblended pass writes the destination
+values. It runs on any Vulkan 1.3 driver; the first device whose name contains the given text is used.
+Needs libvulkan-dev and glslang-tools.
+
+    glslangValidator -V cb_probe.vert -o cb_probe.vert.spv
+    glslangValidator -V cb_probe.frag -o cb_probe.frag.spv
+    g++ -O1 -o cb_probe cb_probe.cpp -lvulkan
+    python3 cb_probe.py gen cb.in                        (prints the pixel count, 340)
+    ./cb_probe RADV cb.in 340 cb.out                     (twice; keep when identical)
+    python3 cb_probe.py show cb.out                      (every stored value)
+    python3 cb_probe.py check cb.out                     (the gfx1036 rules; prints the differences)
+
+RADV_DEBUG=shaders shows the export: on RADV, RGBA16F and R11G11B10 are written with
+v_cvt_pkrtz_f16_f32 and a compressed export, RGBA32F with a 32-bit export. On gfx1036 (Mesa 25.2.8
+RADV), check prints 0 differences:
+
+    unblended / ONE,ZERO  +Inf stays Inf, every NaN becomes the format's NaN (fp16 0xfe00), finite
+                          overflow becomes the largest finite value, negatives become 0 in R11G11B10
+    ONE,ONE ADD           Inf + finite = Inf, Inf + -Inf = NaN, NaN in either operand gives NaN; finite
+                          sums round toward zero and saturate (40000 + 40000 = 0x7bff)
+    MIN / MAX             a NaN operand is ignored and the other one is stored; -0 comes back as +0
+
+Mip selection and resinfo probe (mip_probe.py, mip_runner.cpp)
+--------------------------------------------------------------
+
+mip_runner keeps one 1 MiB image buffer for the whole run. g4_fill writes a 16x16 R32_FLOAT image
+with 5 levels through image_store_mip (the texel at level m, x, y holds m * 1000 + y * 16 + x), so the
+layout of the levels does not matter. The other kernels build the T# and S# from each case and run
+image_gather4_l, image_gather4_lz, image_sample_l (point xy filter, u = v = 0.53) or
+image_get_resinfo (2D array, 2D, 3D).
+
+    python3 mip_probe.py gen k.s in
+    clang-18 -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1036 -c k.s -o k.o && ld.lld-18 -shared k.o -o k.co
+    g++ -O2 -D__HIP_PLATFORM_AMD__ -o mip_runner mip_runner.cpp -lamdhip64
+    ./mip_runner k.co g4_fill in/fill.in - g4_g4l in/samp.in out/g4l.out g4_g4lz in/samp.in out/g4lz.out \
+        g4_sl in/samp.in out/sl.out g4_rinfo2da in/rinfo2da.in out/r2da.out g4_rinfo2d in/rinfo2d.in out/r2d.out \
+        g4_rinfo3d in/rinfo3d.in out/r3d.out
+    python3 mip_probe.py check in out
+
+On gfx1036 check prints 0 differences for every group. The rules it checks are in docs/BLOCKERS.md
+("gather4_l footprint ignores sampler bias/clamp" and "image_get_resinfo array layers are not
+minified"): LOD_BIAS applies to _l, the S# clamp follows the bias, an exact .5 LOD rounds up, and a 2D
+array's layer word is not minified.
+
+f16 output modifier probe (omod_probe.py)
+-----------------------------------------
+
+One kernel per f16-result VALU op and MODE (IEEE 0/1 x f16/f64 denorm mode 0..3, set through the
+kernel descriptor): each runs the op as _e64 without an omod and with mul:2, mul:4 and div:2 on the
+same inputs (8192 cases from om.in).
+
+    python3 omod_probe.py gen k.s om.in > names.txt
+    clang-18 -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1036 -c k.s -o k.o && ld.lld-18 -shared k.o -o k.co
+    g++ -O2 -D__HIP_PLATFORM_AMD__ -o verify_runner verify_runner.cpp -lamdhip64
+    for n in $(cat names.txt); do ./verify_runner k.co $n om.in out/$n.out; done
+    python3 omod_probe.py check out
+
+On gfx1036 check prints 0 differences: the omod acts only with IEEE 0 and f16 output denormals
+flushed (denorm mode 0 or 1); a +-0 or denormal pre-omod result then becomes +0, and a scaled value
+below 2^-14 becomes a zero of its sign.

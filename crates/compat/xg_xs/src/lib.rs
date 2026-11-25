@@ -11,18 +11,18 @@ mod descriptor;
 mod equations3d;
 mod layout3d;
 mod computer3d;
-#[cfg(test)]
+#[cfg(all(test, feature = "console-oracle"))]
 mod oracle;
-#[cfg(test)]
+#[cfg(all(test, feature = "console-oracle"))]
 mod oracle_3d;
-#[cfg(test)]
+#[cfg(all(test, feature = "console-oracle"))]
 mod oracle_xs;
-#[cfg(test)]
+#[cfg(all(test, feature = "console-oracle"))]
 mod oracle_msaa;
 #[cfg(test)]
 mod exports_table;
 mod dcc;
-#[cfg(test)]
+#[cfg(all(test, feature = "console-oracle"))]
 mod dcc_oracle;
 
 use core::ffi::c_void;

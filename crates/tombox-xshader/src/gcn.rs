@@ -199,9 +199,13 @@ fn vop1_map(op: u32) -> Result<u32, String> {
     match op {
         0x00..=0x08 | 0x0a..=0x1a | 0x20..=0x25 | 0x27 | 0x2a | 0x2b | 0x2e | 0x2f | 0x31 | 0x33..=0x44 => Ok(op),
         0x09 => Err("v_mov_fed_b32 (gfx7 VOP1 0x09) has no RDNA2 equivalent".into()),
-        0x26 | 0x28 | 0x29 | 0x2c | 0x2d | 0x30 | 0x32 | 0x45 | 0x46 => {
-            Err(format!("gfx7 VOP1 {op:#x} (clamp/legacy transcendental) has no RDNA2 equivalent yet"))
+        0x29 | 0x2d | 0x45 | 0x46 => {
+            Err(format!("gfx7 VOP1 {op:#x} (legacy transcendental) has no RDNA2 equivalent yet: its special-value rules are not established"))
         }
+        0x26 | 0x28 | 0x2c => {
+            Err(format!("gfx7 VOP1 {op:#x} (clamp transcendental) is lowered in convert() with a clamp fixup"))
+        }
+        0x30 | 0x32 => Err(format!("gfx7 VOP1 {op:#x} (f64 clamp transcendental) has no RDNA2 equivalent yet")),
         _ => Err(format!("gfx7 VOP1 opcode {op:#x} is not defined")),
     }
 }
@@ -297,6 +301,29 @@ fn legacy_minmax(max: bool, vdst: u32, src0: u32, src1: u32, lit: Option<u32>) -
     Ok(out)
 }
 
+const MAX_F32: u32 = 0x7f7f_ffff;
+const NEG_MAX_F32: u32 = 0xff7f_ffff;
+const POS_INF: u32 = 0x7f80_0000;
+const NEG_INF: u32 = 0xff80_0000;
+
+fn clamp_max_fixup(out: &mut Vec<u32>, vdst: u32) {
+    out.extend_from_slice(&vop3(0x02, 104, 0, 0, [256 + vdst, 0xff, 128], 0, 0));
+    out.push(POS_INF);
+    out.extend_from_slice(&vop3(0x101, vdst, 0, 0, [256 + vdst, 0xff, 104], 0, 0));
+    out.push(MAX_F32);
+    out.extend_from_slice(&vop3(0x02, 104, 0, 0, [256 + vdst, 0xff, 128], 0, 0));
+    out.push(NEG_INF);
+    out.extend_from_slice(&vop3(0x101, vdst, 0, 0, [256 + vdst, 0xff, 104], 0, 0));
+    out.push(NEG_MAX_F32);
+}
+
+fn log_clamp_fixup(out: &mut Vec<u32>, vdst: u32) {
+    out.extend_from_slice(&vop3(0x02, 104, 0, 0, [256 + vdst, 0xff, 128], 0, 0));
+    out.push(NEG_INF);
+    out.extend_from_slice(&vop3(0x101, vdst, 0, 0, [256 + vdst, 0xff, 104], 0, 0));
+    out.push(NEG_MAX_F32);
+}
+
 fn is_branch(w: u32) -> bool {
     classify(w) == Enc::Sopp && matches!((w >> 16) & 0x7f, 0x02 | 0x04..=0x09)
 }
@@ -381,9 +408,21 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
             }
         }
         Enc::Vop1 => {
-            let op = vop1_map((w >> 9) & 0xff).map_err(err)?;
-            let mut v = vec![(w & !(0xff << 9)) | op << 9];
+            let gfx_op = (w >> 9) & 0xff;
+            let vdst = (w >> 17) & 0xff;
+            let base = match gfx_op {
+                0x26 => 0x27,
+                0x28 => 0x2a,
+                0x2c => 0x2e,
+                _ => vop1_map(gfx_op).map_err(err)?,
+            };
+            let mut v = vec![(w & !(0xff << 9)) | base << 9];
             v.extend_from_slice(&ins.words[1..]);
+            match gfx_op {
+                0x28 | 0x2c => clamp_max_fixup(&mut v, vdst),
+                0x26 => log_clamp_fixup(&mut v, vdst),
+                _ => {}
+            }
             v
         }
         Enc::Vopc => {
@@ -448,7 +487,22 @@ fn convert(ins: &Insn) -> Result<Vec<u32>, String> {
                         vop3(n, vdst, abs, clamp, s, omod, neg).to_vec()
                     }
                 }
-                0x180..=0x1ff => vop3(0x180 + vop1_map(op - 0x180).map_err(err)?, vdst, abs, clamp, s, omod, neg).to_vec(),
+                0x180..=0x1ff => {
+                    let vop1_op = op - 0x180;
+                    let base = match vop1_op {
+                        0x26 => 0x27,
+                        0x28 => 0x2a,
+                        0x2c => 0x2e,
+                        _ => vop1_map(vop1_op).map_err(err)?,
+                    };
+                    let mut v = vop3(0x180 + base, vdst, abs, clamp, s, omod, neg).to_vec();
+                    match vop1_op {
+                        0x28 | 0x2c => clamp_max_fixup(&mut v, vdst),
+                        0x26 => log_clamp_fixup(&mut v, vdst),
+                        _ => {}
+                    }
+                    v
+                }
                 _ => return Err(err(format!("VOP3 opcode {op:#x} is not defined"))),
             }
         }
@@ -644,23 +698,35 @@ pub fn lower(code: &[u8], data: &[u8]) -> Result<Lowered, String> {
         if ins.enc == Enc::Mubuf && (ins.words[0] >> 15) & 1 != 0 {
             expanded.push(pos..pos + v.len());
         }
-        let is_legacy = match ins.enc {
-            Enc::Vop2 => matches!((ins.words[0] >> 25) & 0x3f, 0x0d | 0x0e),
-            Enc::Vop3 => matches!((ins.words[0] >> 17) & 0x1ff, 0x10d | 0x10e),
-            _ => false,
+        let vcc_clobber: Option<&'static str> = match ins.enc {
+            Enc::Vop2 => match (ins.words[0] >> 25) & 0x3f {
+                0x0d => Some("v_min_legacy_f32"),
+                0x0e => Some("v_max_legacy_f32"),
+                _ => None,
+            },
+            Enc::Vop3 => match (ins.words[0] >> 17) & 0x1ff {
+                0x10d => Some("v_min_legacy_f32"),
+                0x10e => Some("v_max_legacy_f32"),
+                0x1a6 => Some("v_log_clamp_f32"),
+                0x1a8 => Some("v_rcp_clamp_f32"),
+                0x1ac => Some("v_rsq_clamp_f32"),
+                _ => None,
+            },
+            Enc::Vop1 => match (ins.words[0] >> 9) & 0xff {
+                0x26 => Some("v_log_clamp_f32"),
+                0x28 => Some("v_rcp_clamp_f32"),
+                0x2c => Some("v_rsq_clamp_f32"),
+                _ => None,
+            },
+            _ => None,
         };
-        if is_legacy {
+        if let Some(name) = vcc_clobber {
             legacy.push(pos..pos + v.len());
-            let max = match ins.enc {
-                Enc::Vop2 => (ins.words[0] >> 25) & 0x3f == 0x0e,
-                Enc::Vop3 => (ins.words[0] >> 17) & 0x1ff == 0x10e,
-                _ => false,
-            };
-            notes.push(format!(
-                "{} at {:#x}: compare/select, so a NaN in source 1 stays NaN",
-                if max { "v_max_legacy_f32" } else { "v_min_legacy_f32" },
-                ins.offset
-            ));
+            notes.push(match name {
+                "v_min_legacy_f32" | "v_max_legacy_f32" => format!("{name} at {:#x}: compare/select, so a NaN in source 1 stays NaN", ins.offset),
+                "v_log_clamp_f32" => format!("{name} at {:#x}: a -inf result is clamped to -max_float", ins.offset),
+                _ => format!("{name} at {:#x}: +-inf results are clamped to +-max_float", ins.offset),
+            });
         }
         pos += v.len();
         out.push(v);
@@ -724,7 +790,7 @@ pub fn lower(code: &[u8], data: &[u8]) -> Result<Lowered, String> {
             let clash = i.src.iter().chain(i.dst.iter()).any(|o| matches!(o, Opnd::Sgpr(104 | 105)));
             if clash {
                 return Err(format!(
-                    "gfx7 legacy min/max writes its compare into s104:s105 but {} at lowered {:#x} uses them",
+                    "gfx7 legacy min/max and clamp transcendentals write their compare into s104:s105 but {} at lowered {:#x} uses them",
                     i.mnemonic, i.offset
                 ));
             }

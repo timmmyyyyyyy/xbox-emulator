@@ -140,6 +140,22 @@ fn image_mimg_sample() {
         let (x, y) = pt(m, u, v, (0, 0));
         cs.push(case("image_sample_d_cl", op, build(&pre, &op, 4, 4, false), tex(), ea(m, x, y).to_vec()));
     }
+    for &(g, cl, lod) in &[([0.25f32, 0.0, 0.0, 0.25], 0.0f32, 1.0f32), ([0.25, 0.0, 0.0, 0.25], 1.7, 1.0), ([0.125, 0.0, 0.0, 0.125], 0.0, 0.0), ([0.0, 0.5, 0.0625, 0.0], 0.0, 2.0), ([0.0625, 0.0, 0.0, 1.0], 1.2, 3.0)] {
+        let op = mimg(0xa3, 0xf, 1, 10, 4, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(10, f2h(g[0]) | (f2h(g[1]) << 16)).vv(11, f2h(g[2]) | (f2h(g[3]) << 16)).vv(12, fb(u)).vv(13, fb(v)).vv(14, fb(cl));
+        let m = nearest(lod.max(cl), 4);
+        let (x, y) = pt(m, u, v, (0, 0));
+        cs.push(case("image_sample_d_cl_g16", op, build(&pre, &op, 4, 4, false), tex(), ea(m, x, y).to_vec()));
+    }
+    for &(g, lod) in &[([0.25f32, 0.0, 0.0, 0.25], 1.0f32), ([0.125, 0.0, 0.0, 0.125], 0.0), ([0.0, 0.5, 0.0625, 0.0], 2.0)] {
+        let op = mimg(0xa2, 0xf, 1, 10, 4, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(10, f2h(g[0]) | (f2h(g[1]) << 16)).vv(11, f2h(g[2]) | (f2h(g[3]) << 16)).vv(12, fb(u)).vv(13, fb(v));
+        let m = nearest(lod, 4);
+        let (x, y) = pt(m, u, v, (0, 0));
+        cs.push(case("image_sample_d_g16", op, build(&pre, &op, 4, 4, false), tex(), ea(m, x, y).to_vec()));
+    }
     for &(ox, oy) in &[(1i32, -1i32), (-2, 2), (0, 0), (5, 0), (-8, 7)] {
         let op = mimg(0x30, 0xf, 1, 1, 4, 0, 12);
         let mut pre = Prog::new();
@@ -244,6 +260,75 @@ fn image_mimg_compare_gather() {
     run_mem_cases("mimg_compare_gather", &cs);
 }
 
+#[test]
+fn image_mimg_compare_clamp_bias_grad() {
+    let mut cs = Vec::new();
+    let tz = |m: u32, x: u32, y: u32| f32::from_bits(td(m, 0, x, y)[0]);
+    let one = |b: bool| fb(if b { 1.0 } else { 0.0 });
+    let zmid = |u: f32, v: f32| {
+        let (a, b) = (pt(0, u, v, (0, 0)), pt(1, u, v, (0, 0)));
+        0.5 * (tz(0, a.0, a.1) + tz(1, b.0, b.1))
+    };
+    let env = |pos: bool| Env { tex: Some(&IMG_E), samp: Some(sampler(0x80, 3, 2)), pos, ..Default::default() };
+    let (u, v) = (0.3f32, 0.6f32);
+    for &cl in &[0.0f32, 0.4, 0.7, 1.2, 3.0] {
+        let z = zmid(u, v);
+        let op = mimg(0x29, 1, 1, 1, 5, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(1, fb(z)).vv(2, fb(u)).vv(3, fb(v)).vv(4, fb(cl));
+        let m = nearest(cl, 2);
+        let (x, y) = pt(m, u, v, (0, 0));
+        cs.push(case("image_sample_c_cl", op, build(&pre, &op, 5, 1, false), env(false), vec![one(z < tz(m, x, y))]));
+    }
+    for &(k, b, lod) in &PS_K[..2] {
+        for &cl in &[0.0f32, 1.2] {
+            let op = mimg(0x29, 1, 1, 5, 9, 0, 12);
+            let mut pre = Prog::new();
+            let (u0, v0) = pos_uv(&mut pre, 6, 7, k, b);
+            let z = zmid(u0, v0);
+            pre.vv(5, fb(z)).vv(8, fb(cl));
+            let m = nearest((lod as f32).max(cl), 2);
+            let (x, y) = pt(m, u0, v0, (0, 0));
+            cs.push(case("image_sample_c_cl", op, build(&pre, &op, 9, 1, false), env(true), vec![one(z < tz(m, x, y))]));
+        }
+    }
+    for &(k, b, lod) in &PS_K[..2] {
+        for &(bias, cl) in &[(1.0f32, 0.0f32), (-1.0, 0.0), (0.2, 0.0), (-2.0, 1.2), (0.0, 0.0)] {
+            for (mn, opc) in [("image_sample_c_b", 0x2du32), ("image_sample_c_b_cl", 0x2e)] {
+                if opc == 0x2d && cl != 0.0 {
+                    continue;
+                }
+                let op = mimg(opc, 1, 1, 5, 10, 0, 12);
+                let mut pre = Prog::new();
+                pre.vv(5, fb(bias));
+                let (u0, v0) = pos_uv(&mut pre, 7, 8, k, b);
+                let z = zmid(u0, v0);
+                pre.vv(6, fb(z)).vv(9, fb(cl));
+                let m = nearest((lod as f32 + bias).max(if opc == 0x2e { cl } else { 0.0 }), 2);
+                let (x, y) = pt(m, u0, v0, (0, 0));
+                cs.push(case(mn, op, build(&pre, &op, 10, 1, false), env(true), vec![one(z < tz(m, x, y))]));
+            }
+        }
+    }
+    for &(g, lod) in &[([0.25f32, 0.0, 0.0, 0.25], 1.0f32), ([0.125, 0.0, 0.0, 0.125], 0.0), ([0.0, 0.0625, 0.0625, 0.0], 0.0), ([0.0, 0.5, 0.0625, 0.0], 2.0), ([0.0625, 0.0, 0.0, 0.03125], 0.0)] {
+        for &cl in &[0.0f32, 1.3] {
+            for (mn, opc) in [("image_sample_c_d", 0x2au32), ("image_sample_c_d_cl", 0x2b)] {
+                if opc == 0x2a && cl != 0.0 {
+                    continue;
+                }
+                let op = mimg(opc, 1, 1, 10, 20, 0, 12);
+                let z = zmid(u, v);
+                let mut pre = Prog::new();
+                pre.vv(10, fb(z)).vv(11, fb(g[0])).vv(12, fb(g[1])).vv(13, fb(g[2])).vv(14, fb(g[3])).vv(15, fb(u)).vv(16, fb(v)).vv(17, fb(cl));
+                let m = nearest(lod.max(if opc == 0x2b { cl } else { 0.0 }), 2);
+                let (x, y) = pt(m, u, v, (0, 0));
+                cs.push(case(mn, op, build(&pre, &op, 20, 1, false), env(false), vec![one(z < tz(m, x, y))]));
+            }
+        }
+    }
+    run_mem_cases("mimg_compare_lod", &cs);
+}
+
 fn foot_at(m: u32, u: f32, v: f32, off: (i32, i32), wrap: bool) -> [(u32, u32); 4] {
     let s = (8u32 >> m) as i32;
     let i0 = (u * s as f32 - 0.5).floor() as i32 + off.0;
@@ -308,6 +393,157 @@ fn image_mimg_gather_explicit_lod() {
         cs.push(case("image_gather4_c_l", op, build(&pre, &op, 8, 4, false), Env { tex: Some(&IMG_E), samp: Some(sampler(0x80, 3, f)), ..Default::default() }, exp));
     }
     run_mem_cases("mimg_gather_explicit_lod", &cs);
+}
+
+fn lod_words(bias: i32, lo: u32, hi: u32, mip: u32) -> (u32, u32) {
+    (lo | (hi << 12), ((bias as u32) & 0x3fff) | (1 << 20) | (1 << 22) | (mip << 26))
+}
+
+fn lod_sampler(filter: u32, cmp: u32, (w1, w2): (u32, u32)) -> [u8; 52] {
+    let mut s = sampler(filter, 3, cmp);
+    let hi = (w1 >> 12) & 0xfff;
+    let bias = ((((w2 & 0x3fff) << 18) as i32) >> 18) as f32 / 256.0;
+    s[16..20].copy_from_slice(&bias.to_bits().to_le_bytes());
+    s[44..48].copy_from_slice(&((w1 & 0xfff) as f32 / 256.0).to_bits().to_le_bytes());
+    s[48..52].copy_from_slice(&(if hi == 0xfff { f32::MAX } else { hi as f32 / 256.0 }).to_bits().to_le_bytes());
+    s
+}
+
+fn lod_pick(lod: f32, (w1, w2): (u32, u32), mips: u32) -> u32 {
+    let bias = ((((w2 & 0x3fff) << 18) as i32) >> 18) as f32 / 256.0;
+    let (lo, hi) = ((w1 & 0xfff) as f32 / 256.0, ((w1 >> 12) & 0xfff) as f32 / 256.0);
+    nearest((lod + bias).clamp(lo, hi), mips)
+}
+
+fn blind_pick(lod: f32, (w1, w2): (u32, u32), mips: u32) -> (u32, u32) {
+    let bias = (((w2 & 0x3fff) << 18) as i32) >> 18;
+    let (lo, hi) = ((w1 & 0xfff) as i32, ((w1 >> 12) & 0xfff) as i32);
+    let m0 = nearest(lod, mips);
+    let m1 = ((m0 as i32 * 256 + bias).clamp(lo, if hi == 0xfff { i32::MAX } else { hi }) / 256).clamp(0, mips as i32 - 1) as u32;
+    (m0, m1)
+}
+
+fn blind_foot(m0: u32, m1: u32, u: f32, v: f32, off: (i32, i32)) -> Vec<(u32, u32)> {
+    let (s0, s1) = ((8i32 >> m0) as f32, 8i32 >> m1);
+    let i = (u * s0 - 0.5).floor() as i32 + off.0;
+    let j = (v * s0 - 0.5).floor() as i32 + off.1;
+    let c = |a: i32| ((2 * a + 1) * s1).div_euclid(2 * s0 as i32).clamp(0, s1 - 1) as u32;
+    vec![(c(i), c(j + 1)), (c(i + 1), c(j + 1)), (c(i + 1), c(j)), (c(i), c(j))]
+}
+
+fn lod_prog(sw: Option<(u32, u32)>, vals: &[u32]) -> Prog {
+    let mut pre = Prog::new();
+    if let Some((w1, w2)) = sw {
+        pre.sv(13, w1).sv(14, w2);
+    }
+    for (k, &x) in vals.iter().enumerate() {
+        pre.vv(k as u32 + 1, x);
+    }
+    pre
+}
+
+fn run_direct(group: &str, cs: &[(MCase, bool)]) {
+    let mut fails = Vec::new();
+    for (i, (c, blind)) in cs.iter().enumerate() {
+        let t = translate(&extract_code(&c.words, c.env.pos, None));
+        match &t {
+            Ok(t) if t.gather_lod_blind.is_empty() == *blind => fails.push(format!("#{i} {}: gather_lod_blind {:x?}, want blind={blind}", c.m, t.gather_lod_blind)),
+            Err(e) => fails.push(format!("#{i} {}: translate {e}", c.m)),
+            _ => {}
+        }
+        match exec(&c.words, &c.env) {
+            Ok(o) if o.rt[..c.rt.len()] == c.rt[..] => {}
+            Ok(o) => fails.push(format!("#{i} {}: rt {:08x?} want {:08x?}\n{}", c.m, &o.rt[..c.rt.len()], c.rt, t.map(|t| t.hlsl).unwrap_or_default())),
+            Err(e) => fails.push(format!("#{i} {}: {}", c.m, e.lines().take(4).collect::<Vec<_>>().join(" | "))),
+        }
+    }
+    println!("{group}: {} cases", cs.len());
+    assert!(fails.is_empty(), "{group}: {} failing\n{}", fails.len(), fails.join("\n\n"));
+}
+
+#[test]
+fn image_mimg_gather_explicit_lod_sampler_bias_and_clamp() {
+    let mut cs = Vec::new();
+    let (gu, gv) = (0.3f32, 0.55f32);
+    let none = 0xfff;
+    for &(lod, bias, lo, hi, filt, dmask) in &[
+        (0.0f32, 256i32, 0u32, none, 0u32, 1u32),
+        (0.3, 384, 0, none, 0x15, 2),
+        (3.0, 0, 0, 0x100, 0, 4),
+        (0.0, -256, 0x200, none, 0x15, 8),
+        (2.0, -192, 0, none, 0x15, 1),
+        (1.0, 768, 0, none, 0, 2),
+        (0.0, 0, 0x500, none, 0, 4),
+        (2.6, 256, 0x100, 0x200, 0x15, 8),
+        (-1.0, 128, 0, none, 0, 1),
+    ] {
+        let sw = lod_words(bias, lo, hi, if filt & 1 != 0 { 2 } else { 1 });
+        let ch = dmask.trailing_zeros() as usize;
+        let op = mimg(0x44, dmask, 1, 1, 8, 0, 12);
+        let words = build(&lod_prog(Some(sw), &[fb(gu), fb(gv), fb(lod)]), &op, 8, 4, false);
+        let m = lod_pick(lod, sw, 4);
+        let exp: Vec<u32> = foot_at(m, gu, gv, (0, 0), false).iter().map(|&(x, y)| ea(m, x, y)[ch]).collect();
+        if filt == 0 && bias % 256 == 0 {
+            if let Some(rw) = runtime_words(&words, &op, vop1(0x07, 200, v(2))) {
+                let (m0, m1) = blind_pick(lod, sw, 4);
+                let exp: Vec<u32> = blind_foot(m0, m1, gu, gv, (0, 0)).iter().map(|&(x, y)| ea(m1, x, y)[ch]).collect();
+                cs.push((case("image_gather4_l", op, rw, Env { tex: Some(&IMG_A), samp: Some(lod_sampler(filt, 0, sw)), pos: true, ..Default::default() }, exp), true));
+            }
+        }
+        cs.push((case("image_gather4_l", op, words, Env { tex: Some(&IMG_A), samp: Some(lod_sampler(filt, 0, sw)), ..Default::default() }, exp), false));
+    }
+    for &(ox, oy, lod, bias, hi) in &[(1i32, -1i32, 0.0f32, 256i32, 0xfffu32), (-2, 3, 2.0, 0, 0x100)] {
+        let sw = lod_words(bias, 0, hi, 1);
+        let op = mimg(0x54, 2, 1, 1, 8, 0, 12);
+        let words = build(&lod_prog(Some(sw), &[packoff(ox, oy), fb(gu), fb(gv), fb(lod)]), &op, 8, 4, false);
+        let m = lod_pick(lod, sw, 4);
+        let exp: Vec<u32> = foot_at(m, gu, gv, (ox, oy), false).iter().map(|&(x, y)| ea(m, x, y)[1]).collect();
+        cs.push((case("image_gather4_l_o", op, words, Env { tex: Some(&IMG_A), samp: Some(lod_sampler(0, 0, sw)), ..Default::default() }, exp), false));
+    }
+    for &(layer, lod, bias, hi) in &[(2.0f32, 0.0f32, 256i32, 0xfffu32), (1.0, 1.0, 0, 0)] {
+        let sw = lod_words(bias, 0, hi, 1);
+        let op = mimg(0x44, 4, 5, 1, 8, 0, 12);
+        let words = build(&lod_prog(Some(sw), &[fb(gu), fb(gv), fb(layer), fb(lod)]), &op, 8, 4, false);
+        let m = lod_pick(lod, sw, 2);
+        let exp: Vec<u32> = foot_at(m, gu, gv, (0, 0), false).iter().map(|&(x, y)| ea(m, x, y)[2]).collect();
+        cs.push((case("image_gather4_l", op, words, Env { tex: Some(&IMG_C), samp: Some(lod_sampler(0, 0, sw)), ..Default::default() }, exp), false));
+    }
+    let one = |b: bool| fb(if b { 1.0 } else { 0.0 });
+    for &(z, lod, bias, hi) in &[(0.5f32 + 6.5 / 64.0, 0.0f32, 256i32, 0xfffu32), (30.5 / 64.0, 1.0, 0, 0)] {
+        let sw = lod_words(bias, 0, hi, 1);
+        let op = mimg(0x4c, 1, 1, 1, 8, 0, 12);
+        let words = build(&lod_prog(Some(sw), &[fb(z), fb(gu), fb(gv), fb(lod)]), &op, 8, 4, false);
+        let m = lod_pick(lod, sw, 2);
+        let exp: Vec<u32> = foot_at(m, gu, gv, (0, 0), false).iter().map(|&(x, y)| one(z < f32::from_bits(td(m, 0, x, y)[0]))).collect();
+        cs.push((case("image_gather4_c_l", op, words, Env { tex: Some(&IMG_E), samp: Some(lod_sampler(0x80, 2, sw)), ..Default::default() }, exp), false));
+    }
+    for &(lod, bias, lo, hi) in &[(0.0f32, 256i32, 0u32, 0xfffu32), (3.0, 0, 0, 0x100), (0.0, 0, 0x200, 0xfff)] {
+        let sw = lod_words(bias, lo, hi, 1);
+        let op = mimg(0x44, 1, 1, 1, 8, 0, 12);
+        let words = build(&lod_prog(None, &[fb(gu), fb(gv), fb(lod)]), &op, 8, 4, false);
+        let (m0, m1) = blind_pick(lod, sw, 4);
+        let exp: Vec<u32> = blind_foot(m0, m1, gu, gv, (0, 0)).iter().map(|&(x, y)| ea(m1, x, y)[0]).collect();
+        cs.push((case("image_gather4_l", op, words, Env { tex: Some(&IMG_A), samp: Some(lod_sampler(0, 0, sw)), ..Default::default() }, exp), true));
+    }
+    run_direct("mimg_gather_explicit_lod_sampler", &cs);
+}
+
+#[test]
+fn image_mimg_gather_explicit_lod_sampler_refusals() {
+    let op = mimg(0x44, 1, 1, 1, 8, 0, 12);
+    for &((w1, w2), why) in &[
+        (lod_words(0, 0x180, 0xfff, 1), "fractional S# MIN_LOD 0x180"),
+        (lod_words(0, 0, 0x280, 2), "MAX_LOD 0x280 unsupported"),
+        (lod_words(0, 0x300, 0x100, 1), "S# MIN_LOD 0x300 above MAX_LOD 0x100"),
+        (lod_words(0, 0, 0xfff, 0), "S# MIP_FILTER 0 unsupported"),
+        ((0xfff000, lod_words(0, 0, 0, 1).1 | (4 << 14)), "S# LOD_BIAS_SEC 0x4"),
+    ] {
+        let words = build(&lod_prog(Some((w1, w2)), &[fb(0.3), fb(0.55), fb(1.0)]), &op, 8, 4, false);
+        match translate(&extract(&words, false)) {
+            Err(e) => assert!(e.contains("image_gather4_l at ") && e.contains(why), "S# {w1:#x} {w2:#x}: error {e:?}, want {why:?}"),
+            Ok(_) => panic!("S# {w1:#x} {w2:#x}: translated, want refusal {why:?}"),
+        }
+    }
 }
 
 #[test]
@@ -795,4 +1031,356 @@ fn image_mimg_atomics_rdna2_silicon() {
     }
     println!("expected values recorded on {}", super::mimg_rdna2::SOURCE);
     run_mem_cases("mimg_atomics_rdna2_silicon", &cs);
+}
+
+#[test]
+fn image_sample_g16_refuses_non_2d_gradients() {
+    for (dim, n) in [(0u32, 1usize), (2, 3)] {
+        let op = mimg(0xa2, 0xf, dim, 10, 4, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(10, 0).vv(11, 0).vv(12, 0).vv(13, 0).vv(14, 0).vv(15, 0).vv(16, 0);
+        let words = build(&pre, &op, 4, 4, false);
+        let err = match translate(&extract(&words, false)) {
+            Ok(t) => panic!("dim {dim} g16 sample translated:
+{}", t.hlsl),
+            Err(e) => e,
+        };
+        assert!(err.contains(&format!("with {n}-component 16-bit gradients is not lowered")), "dim {dim}: {err}");
+    }
+}
+
+#[test]
+fn image_gather4_bias_and_dmask_refusals() {
+    for (op, operands) in [(mimg(0x45, 0xf, 1, 1, 4, 0, 12), 3u32), (mimg(0x46, 0xf, 1, 1, 4, 0, 12), 4)] {
+        let mut pre = Prog::new();
+        pre.vv(1, fb(0.5));
+        pre.vv(2, fb(0.25)).vv(3, fb(0.75));
+        if operands == 4 {
+            pre.vv(4, fb(1.0));
+        }
+        let words = build(&pre, &op, 4, 4, false);
+        let err = match translate(&extract(&words, false)) {
+            Ok(t) => panic!("expected a gather4 bias refusal, got:\n{}", t.hlsl),
+            Err(e) => e,
+        };
+        assert!(err.contains("gather4 with LOD bias or clamp unsupported"), "{err}");
+    }
+
+    let bad_mask = mimg(0x47, 0x3, 1, 1, 4, 0, 12);
+    let mut pre = Prog::new();
+    pre.vv(1, fb(0.25)).vv(2, fb(0.75));
+    let words = build(&pre, &bad_mask, 4, 4, false);
+    let err = match translate(&extract(&words, false)) {
+        Ok(t) => panic!("expected a gather4 dmask refusal, got:\n{}", t.hlsl),
+        Err(e) => e,
+    };
+    assert!(err.contains("gather4 with dmask 0x3 unsupported"), "{err}");
+
+    let alpha = mimg(0x47, 0x8, 1, 1, 4, 0, 12);
+    let words = build(&pre, &alpha, 4, 1, false);
+    let t = translate(&extract(&words, false)).expect("single-channel gather4_lz translates");
+    assert!(t.hlsl.contains(".GatherAlpha("), "{}", t.hlsl);
+}
+
+#[test]
+fn image_dim_refusals_are_explicit() {
+    for (op, needle) in [
+        (mimg(0x00, 0xf, 3, 1, 4, 0, 12), "image dim 3 unsupported for load/store"),
+        (mimg(0x00, 0xf, 7, 1, 4, 0, 12), "image dim 7 unsupported for load/store"),
+        (mimg(0x0e, 0xf, 7, 1, 4, 0, 12), "image dim 7 unsupported for get_resinfo"),
+        (mimg(0x60, 0xf, 6, 6, 4, 0, 12), "image dim 6 unsupported for get_lod"),
+    ] {
+        let mut pre = Prog::new();
+        pre.vv(1, fb(0.5)).vv(2, fb(0.5)).vv(3, fb(0.5)).vv(4, fb(0.5));
+        let words = build(&pre, &op, 4, 4, false);
+        match translate(&extract(&words, false)) {
+            Ok(t) => panic!("expected {needle}, got:\n{}", t.hlsl),
+            Err(e) => assert!(e.contains(needle), "expected {needle} in error: {e}"),
+        }
+    }
+}
+
+#[test]
+fn image_multisampled_uav_load_refused() {
+    let op = mimg(0x00, 0xf, 6, 1, 4, 16, 0);
+    let mut pre = Prog::new();
+    pre.vv(1, fb(0.5)).vv(2, fb(0.5)).vv(3, 0);
+    let words = build(&pre, &op, 4, 4, true);
+    match translate(&extract(&words, false)) {
+        Ok(t) => panic!("expected a multisampled UAV load refusal, got:\n{}", t.hlsl),
+        Err(e) => assert!(e.contains("multisampled UAV load unsupported"), "{e}"),
+    }
+}
+
+const WIDE_K: [(f32, f32, i32); 5] = [(0.125, 0.3, 0), (0.25, 0.2, 1), (0.5, 0.1, 2), (1.0, 0.05, 3), (2.0, 0.02, 4)];
+
+fn compare_passes(func: u32, z: f32, texel: f32) -> bool {
+    match func {
+        2 => z < texel,
+        3 => z == texel,
+        4 => z <= texel,
+        5 => z > texel,
+        6 => z != texel,
+        7 => z >= texel,
+        8 => true,
+        _ => false,
+    }
+}
+
+#[test]
+fn image_mimg_implicit_lod_samples() {
+    let mut cs = Vec::new();
+    let tex = || Env { tex: Some(&IMG_A), samp: ptsamp(), pos: true, ..Default::default() };
+    for &(k, b, lod) in &WIDE_K {
+        for dmask in [0xfu32, 0x5, 0x8] {
+            let op = mimg(0x20, dmask, 1, 6, 4, 0, 12);
+            let mut pre = Prog::new();
+            let (u0, v0) = pos_uv(&mut pre, 6, 7, k, b);
+            let m = nearest(lod as f32, 4);
+            let (x, y) = pt(m, u0, v0, (0, 0));
+            cs.push(case("image_sample", op, build(&pre, &op, 4, dmask.count_ones(), false), tex(), pick(ea(m, x, y), dmask)));
+        }
+    }
+    for &(k, b, lod) in &PS_K {
+        for &bias in &[1.0f32, -1.0, 0.4, 2.0, -3.0] {
+            let op = mimg(0x25, 0xf, 1, 6, 4, 0, 12);
+            let mut pre = Prog::new();
+            pre.vv(6, fb(bias));
+            let (u0, v0) = pos_uv(&mut pre, 7, 8, k, b);
+            let m = nearest(lod as f32 + bias, 4);
+            let (x, y) = pt(m, u0, v0, (0, 0));
+            cs.push(case("image_sample_b", op, build(&pre, &op, 4, 4, false), tex(), ea(m, x, y).to_vec()));
+        }
+    }
+    let (u, v) = (0.3f32, 0.6f32);
+    for &(g, lod) in &[
+        ([0.25f32, 0.0, 0.0, 0.25], 1.0f32),
+        ([0.125, 0.0, 0.0, 0.125], 0.0),
+        ([0.5, 0.0, 0.0, 0.0625], 2.0),
+        ([0.0, 0.5, 0.25, 0.0], 2.0),
+        ([1.0, 0.0, 0.0, 1.0], 3.0),
+        ([2.0, 0.0, 0.0, 2.0], 4.0),
+    ] {
+        let op = mimg(0x22, 0xf, 1, 10, 4, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(10, fb(g[0])).vv(11, fb(g[1])).vv(12, fb(g[2])).vv(13, fb(g[3])).vv(14, fb(u)).vv(15, fb(v));
+        let m = nearest(lod, 4);
+        let (x, y) = pt(m, u, v, (0, 0));
+        cs.push(case("image_sample_d", op, build(&pre, &op, 4, 4, false), Env { tex: Some(&IMG_A), samp: ptsamp(), ..Default::default() }, ea(m, x, y).to_vec()));
+    }
+    run_mem_cases("mimg_implicit_lod", &cs);
+}
+
+#[test]
+fn image_mimg_lz_variants_ignore_the_gradients() {
+    let mut cs = Vec::new();
+    for &(k, b, _) in &WIDE_K {
+        for &(f, z) in &[(2u32, 0.5f32), (2, 0.6), (5, 0.6), (3, 34.0 / 64.0), (7, 34.0 / 64.0), (8, 0.0), (1, 0.0)] {
+            let op = mimg(0x2f, 1, 1, 6, 4, 0, 12);
+            let mut pre = Prog::new();
+            pre.vv(6, fb(z));
+            let (u0, v0) = pos_uv(&mut pre, 7, 8, k, b);
+            let (x, y) = pt(0, u0, v0, (0, 0));
+            let texel = f32::from_bits(td(0, 0, x, y)[0]);
+            let want = fb(if compare_passes(f, z, texel) { 1.0 } else { 0.0 });
+            cs.push(case("image_sample_c_lz", op, build(&pre, &op, 4, 1, false), Env { tex: Some(&IMG_E), samp: Some(sampler(0x80, 3, f)), pos: true, ..Default::default() }, vec![want]));
+        }
+    }
+    for &(k, b, _) in &WIDE_K {
+        for &(ox, oy) in &[(1i32, 1i32), (-2, 3), (0, 0), (5, -4)] {
+            let op = mimg(0x37, 0xf, 1, 6, 4, 0, 12);
+            let mut pre = Prog::new();
+            pre.vv(6, packoff(ox, oy));
+            let (u0, v0) = pos_uv(&mut pre, 7, 8, k, b);
+            let (x, y) = pt(0, u0, v0, (ox, oy));
+            cs.push(case("image_sample_lz_o", op, build(&pre, &op, 4, 4, false), Env { tex: Some(&IMG_A), samp: ptsamp(), pos: true, ..Default::default() }, ea(0, x, y).to_vec()));
+        }
+    }
+    for &(k, dmask) in &[(0.125f32, 1u32), (0.25, 2), (0.5, 4), (1.0, 8), (2.0, 1)] {
+        let ch = dmask.trailing_zeros() as usize;
+        let op = mimg(0x47, dmask, 1, 6, 8, 0, 12);
+        let mut pre = Prog::new();
+        let (u0, v0) = pos_at(&mut pre, 6, 7, k, 0.55, 0.45);
+        let exp: Vec<u32> = foot_at(0, u0, v0, (0, 0), false).iter().map(|&(x, y)| ea(0, x, y)[ch]).collect();
+        cs.push(case("image_gather4_lz", op, build(&pre, &op, 8, 4, false), Env { tex: Some(&IMG_A), samp: ptsamp(), pos: true, ..Default::default() }, exp));
+    }
+    run_mem_cases("mimg_lz_variants", &cs);
+}
+
+#[test]
+fn image_mimg_load_mip_selects_the_level() {
+    let mut cs = Vec::new();
+    let tex = || Env { tex: Some(&IMG_A), samp: ptsamp(), ..Default::default() };
+    for &(x, y, mip, dmask) in &[(3u32, 3u32, 0u32, 0xfu32), (2, 1, 1, 0xf), (1, 0, 2, 0x5), (0, 0, 3, 0x8), (3, 2, 1, 0x3), (7, 7, 0, 0x1), (1, 1, 2, 0xf)] {
+        let op = mimg(0x01, dmask, 1, 1, 4, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(1, x).vv(2, y).vv(3, mip);
+        cs.push(case("image_load_mip", op, build(&pre, &op, 4, dmask.count_ones(), false), tex(), pick(ea(mip, x, y), dmask)));
+    }
+    for &(x, y, mip) in &[(9u32, 9u32, 0u32), (4, 0, 1), (0, 0, 4), (2, 2, 3)] {
+        let op = mimg(0x01, 0xf, 1, 1, 4, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(1, x).vv(2, y).vv(3, mip);
+        cs.push(case("image_load_mip", op, build(&pre, &op, 4, 4, false), tex(), vec![0; 4]));
+    }
+    run_mem_cases("mimg_load_mip", &cs);
+}
+
+#[test]
+fn image_glc_and_dlc_accesses_are_globally_coherent() {
+    for (bits, store, want) in [(0u32, true, false), (1 << 13, true, true), (1 << 7, true, true), (1 << 13, false, false)] {
+        let mut op = mimg(0x00, 0xf, 1, 1, 4, 16, 0).to_vec();
+        op[0] |= bits;
+        if store {
+            op.extend_from_slice(&mimg(0x08, 0xf, 1, 1, 4, 16, 0));
+        }
+        let mut pre = Prog::new();
+        pre.vv(1, 2).vv(2, 3);
+        let h = translate(&extract(&build(&pre, &op, 4, 4, true), false)).unwrap_or_else(|e| panic!("bits {bits:#x} store {store}: {e}")).hlsl;
+        assert_eq!(h.contains("globallycoherent RWTexture2D"), want, "bits {bits:#x} store {store}:\n{h}");
+    }
+}
+fn tpck(m: u32, _l: u32, x: u32, y: u32) -> [u32; 4] {
+    let v = match (m, x, y) {
+        (0, 1, 2) => 0x8000_0080,
+        (0, 6, 3) => 0xffff_8000,
+        (1, 2, 1) => 0x0000_ff80,
+        (2, 1, 1) => 0x7fff_ffff,
+        _ => 0x5000_0000 | (m << 16) | (y << 8) | x,
+    };
+    [v, 0, 0, 0]
+}
+
+fn tpck_v(m: u32, x: u32, y: u32) -> u32 {
+    tpck(m, 0, x, y)[0]
+}
+
+const IMG_PCK: Img = Img { w: 8, h: 8, layers: 1, array: false, mips: 3, fmt: R32_UINT, texel: tpck };
+
+fn pck_atomic_prefix(pre: &mut Prog) {
+    pre.vv(10, 0).vv(11, 7).vv(12, 0);
+    pre.raw(&mimg(0x19, 0x1, 1, 10, 12, 16, 0));
+}
+
+#[test]
+fn image_mimg_pck_on_atomic_images() {
+    let mut cs = Vec::new();
+    for (m, opc) in [("image_load_pck", 0x02u32), ("image_load_pck_sgn", 0x03)] {
+        for &(x, y) in &[(1u32, 2u32), (6, 3), (4, 5), (0, 7)] {
+            let op = mimg(opc, 0x1, 1, 1, 4, 16, 0);
+            let mut pre = Prog::new();
+            pck_atomic_prefix(&mut pre);
+            pre.vv(1, x).vv(2, y);
+            cs.push(MCase { m, op: op.to_vec(), words: build(&pre, &op, 4, 1, true), env: Env { uav: Some(&IMG_PCK), ..Default::default() }, rt: vec![tpck_v(0, x, y)], uav: vec![], tol: 0.0 });
+        }
+    }
+    for (m, opc) in [("image_load_mip_pck", 0x04u32), ("image_load_mip_pck_sgn", 0x05)] {
+        for &(x, y, mip) in &[(1u32, 2u32, 0u32), (2, 1, 1), (1, 1, 2), (3, 0, 1)] {
+            let op = mimg(opc, 0x1, 1, 1, 4, 16, 0);
+            let mut pre = Prog::new();
+            pck_atomic_prefix(&mut pre);
+            pre.vv(1, x).vv(2, y).vv(3, mip);
+            cs.push(MCase { m, op: op.to_vec(), words: build(&pre, &op, 4, 1, true), env: Env { uav: Some(&IMG_PCK), ..Default::default() }, rt: vec![tpck_v(mip, x, y)], uav: vec![], tol: 0.0 });
+        }
+    }
+    for &(x, y, val) in &[(2u32, 3u32, 0x8000_0080u32), (5, 0, 0xffff_ff80), (7, 6, 0x0000_8000)] {
+        let op = mimg(0x0a, 0x1, 1, 1, 4, 16, 0);
+        let mut pre = Prog::new();
+        pck_atomic_prefix(&mut pre);
+        pre.vv(1, x).vv(2, y).vv(4, val);
+        let at = |x: u32, y: u32| (y * 8 + x) as usize;
+        let uav = vec![(0usize, at(x, y), val), (0, at(x ^ 1, y), tpck_v(0, x ^ 1, y)), (1, 0, tpck_v(1, 0, 0))];
+        cs.push(MCase { m: "image_store_pck", op: op.to_vec(), words: build(&pre, &op, 4, 0, true), env: Env { uav: Some(&IMG_PCK), ..Default::default() }, rt: vec![], uav, tol: 0.0 });
+    }
+    for &(x, y, mip, val) in &[(2u32, 1u32, 1u32, 0xffff_8000u32), (1, 0, 2, 0x8000_0001), (6, 6, 0, 0x0000_00ff)] {
+        let op = mimg(0x0b, 0x1, 1, 1, 4, 16, 0);
+        let mut pre = Prog::new();
+        pck_atomic_prefix(&mut pre);
+        pre.vv(1, x).vv(2, y).vv(3, mip).vv(4, val);
+        let mw = 8u32 >> mip;
+        let at = |x: u32, y: u32| (y * mw + x) as usize;
+        let nm = (mip + 1) % 3;
+        let uav = vec![(mip as usize, at(x, y), val), (mip as usize, at(x ^ 1, y), tpck_v(mip, x ^ 1, y)), (nm as usize, 0, tpck_v(nm, 0, 0))];
+        cs.push(MCase { m: "image_store_mip_pck", op: op.to_vec(), words: build(&pre, &op, 4, 0, true), env: Env { uav: Some(&IMG_PCK), ..Default::default() }, rt: vec![], uav, tol: 0.0 });
+    }
+    run_mem_cases("mimg_pck", &cs);
+}
+
+#[test]
+fn image_mimg_pck_on_64bit_atomic_images() {
+    if !atomic_int64_on_typed_resource_supported() {
+        println!("SKIP image_mimg_pck_on_64bit_atomic_images: AtomicInt64OnTypedResourceSupported is false on this device");
+        return;
+    }
+    let mut cs = Vec::new();
+    let prefix = |pre: &mut Prog| {
+        pre.vv(10, 5).vv(11, 0).vv(12, 0).vv(13, 0);
+        pre.raw(&mimg(0x19, 0x3, 1, 10, 12, 16, 0));
+    };
+    for (m, opc) in [("image_load_pck", 0x02u32), ("image_load_pck_sgn", 0x03)] {
+        for &x in &[2u32, 3, 7] {
+            let op = mimg(opc, 0x3, 1, 1, 4, 16, 0);
+            let mut pre = Prog::new();
+            prefix(&mut pre);
+            pre.vv(1, x).vv(2, 0);
+            let v = AT64_INIT[x as usize];
+            cs.push(MCase { m, op: op.to_vec(), words: build(&pre, &op, 4, 2, true), env: Env { uav: Some(&IMG_AT64), ..Default::default() }, rt: vec![v as u32, (v >> 32) as u32], uav: vec![], tol: 0.0 });
+        }
+    }
+    {
+        let (x, val) = (1u32, 0x8000_0000_ffff_ff80u64);
+        let op = mimg(0x0a, 0x3, 1, 1, 4, 16, 0);
+        let mut pre = Prog::new();
+        prefix(&mut pre);
+        pre.vv(1, x).vv(2, 0).vv(4, val as u32).vv(5, (val >> 32) as u32);
+        let nbr = AT64_INIT[0];
+        let uav = vec![(0usize, 2, val as u32), (0, 3, (val >> 32) as u32), (0, 0, nbr as u32), (0, 1, (nbr >> 32) as u32)];
+        cs.push(MCase { m: "image_store_pck", op: op.to_vec(), words: build(&pre, &op, 4, 0, true), env: Env { uav: Some(&IMG_AT64), ..Default::default() }, rt: vec![], uav, tol: 0.0 });
+    }
+    run_mem_cases("mimg_pck_64bit", &cs);
+}
+
+#[test]
+fn image_mimg_pck_and_float_atomic_refusals() {
+    let refuse = |words: &[u32], needle: &str| {
+        let err = match translate(&extract(words, false)) {
+            Ok(t) => panic!("expected refusal ({needle}), got:\n{}", t.hlsl),
+            Err(e) => e,
+        };
+        assert!(err.contains(needle), "expected {needle} in error: {err}");
+    };
+    for opc in [0x02u32, 0x03] {
+        let op = mimg(opc, 0x1, 1, 1, 4, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(1, 2).vv(2, 3);
+        refuse(&build(&pre, &op, 4, 1, false), "raw texel bits");
+    }
+    for opc in [0x02u32, 0x0a] {
+        let op = mimg(opc, 0x1, 1, 1, 4, 16, 0);
+        let mut pre = Prog::new();
+        pre.vv(1, 2).vv(2, 3).vv(4, 9);
+        refuse(&build(&pre, &op, 4, if opc == 0x02 { 1 } else { 0 }, true), "raw texel bits");
+    }
+    {
+        let op = mimg(0x02, 0xf, 1, 1, 4, 16, 0);
+        let mut pre = Prog::new();
+        pck_atomic_prefix(&mut pre);
+        pre.vv(1, 2).vv(2, 3);
+        refuse(&build(&pre, &op, 4, 4, true), "dmask 0xf");
+    }
+    {
+        let op = d16(mimg(0x0a, 0x1, 1, 1, 4, 16, 0));
+        let mut pre = Prog::new();
+        pck_atomic_prefix(&mut pre);
+        pre.vv(1, 2).vv(2, 3).vv(4, 9);
+        refuse(&build(&pre, &op, 4, 0, true), "D16");
+    }
+    for (opc, dmask, name) in [(0x1du32, 0x3u32, "image_atomic_fcmpswap"), (0x1e, 0x1, "image_atomic_fmin"), (0x1f, 0x1, "image_atomic_fmax")] {
+        let op = mimg(opc, dmask, 1, 1, 4, 16, 0);
+        let mut pre = Prog::new();
+        pre.vv(1, 2).vv(2, 3).vv(4, fb(1.5)).vv(5, fb(2.5));
+        let mut glc = op;
+        glc[0] |= 1 << 13;
+        refuse(&build(&pre, &glc, 4, 1, true), &format!("{name} at"));
+    }
 }

@@ -118,7 +118,7 @@
 118 XbtpLinkQueryStatistics implemented | console body is mov eax, 0x80004001; ret in all four dumps (Fortnite 0xdb90 shared, Terraria/XDefiant 0x302c0, Trackmania 0x30240); console body reproduced exactly; oracle test tests/console_fixed.rs
 119 XbtpLinkRecv implemented | device IOCTL 0x22000b or WSARecv, overlapped or blocking
 120 XbtpLinkSend implemented | DATA header 0xfe000001 plus WSABUFs via IOCTL 0x220007 or WSASend; 0x8c110514 size limits
-121 XbtpLinkSetCompletionPort implemented | CreateIoCompletionPort on device handle, HRESULT from GetLastError
+121 XbtpLinkSetCompletionPort implemented | CreateIoCompletionPort on native device handles; in-process endpoints retain the port/key and queue synchronous, pending and cancelled overlapped completions with their NT status unless the event low bit is set
 122 XbtpLinkSetRoutingRedirect implemented | resolves sockaddr into global redirect, result ignored, S_OK (console)
 123 XbtpLinkSetServiceOptions implemented | console body is mov eax, 0x80004001; ret in all four dumps (Fortnite 0xdb90 shared, Terraria/XDefiant 0x300e0, Trackmania 0x30080); console body reproduced exactly; oracle test tests/console_fixed.rs
 124 XbtpLinkSetupRoutingLog implemented | console body is mov eax, 0x80004001; ret in all four dumps (Fortnite 0xdb90 shared, Terraria/XDefiant 0x32690, Trackmania 0x326d0); console body reproduced exactly; oracle test tests/console_fixed.rs

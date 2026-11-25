@@ -7,6 +7,7 @@
 //! traversal, absolute paths, drive letters, symlinks, and decompression-bomb
 //! ratios *before* any extraction happens.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -15,6 +16,9 @@ const SIG_EOCD: u32 = 0x0605_4b50;
 const SIG_EOCD64: u32 = 0x0606_4b50;
 const SIG_EOCD64_LOCATOR: u32 = 0x0706_4b50;
 const SIG_CENTRAL: u32 = 0x0201_4b50;
+
+const EOCD_LEN: usize = 22;
+const ZIP64_LOCATOR_LEN: usize = 20;
 
 const MAX_CD_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB cap on central directory
 
@@ -112,12 +116,12 @@ pub fn read_inventory<P: AsRef<Path>>(path: P) -> Result<ZipInventory> {
     let file_len = file
         .seek(SeekFrom::End(0))
         .map_err(|e| ArchiveError::Io(e.to_string()))?;
-    if file_len < 22 {
+    if file_len < EOCD_LEN as u64 {
         return Err(ArchiveError::NotZip("file smaller than EOCD record".into()));
     }
 
-    // --- locate the EOCD by scanning the tail (max comment 65535 + 22) ---
-    let tail_len = std::cmp::min(file_len, 65_557) as usize;
+    let max_tail_len = ZIP64_LOCATOR_LEN + EOCD_LEN + usize::from(u16::MAX);
+    let tail_len = file_len.min(max_tail_len as u64) as usize;
     let tail_start = file_len - tail_len as u64;
     let tail = read_at(&mut file, tail_start, tail_len)?;
     let eocd_rel = find_eocd(&tail)
@@ -134,12 +138,12 @@ pub fn read_inventory<P: AsRef<Path>>(path: P) -> Result<ZipInventory> {
     if sentinel {
         zip64 = true;
         // The ZIP64 EOCD locator sits 20 bytes before the EOCD record.
-        if eocd_rel < 20 {
+        if eocd_rel < ZIP64_LOCATOR_LEN {
             return Err(ArchiveError::Malformed(
                 "ZIP64 indicated but no room for locator before EOCD".into(),
             ));
         }
-        let loc = &tail[eocd_rel - 20..eocd_rel];
+        let loc = &tail[eocd_rel - ZIP64_LOCATOR_LEN..eocd_rel];
         if u32le(loc, 0)? != SIG_EOCD64_LOCATOR {
             return Err(ArchiveError::Malformed("ZIP64 EOCD locator signature wrong".into()));
         }
@@ -193,11 +197,11 @@ pub fn read_inventory<P: AsRef<Path>>(path: P) -> Result<ZipInventory> {
 
 fn find_eocd(buf: &[u8]) -> Option<usize> {
     let s = SIG_EOCD.to_le_bytes();
-    let mut i = buf.len().checked_sub(22)?;
+    let mut i = buf.len().checked_sub(EOCD_LEN)?;
     loop {
         if buf[i..i + 4] == s {
             let comment = u16::from_le_bytes([buf[i + 20], buf[i + 21]]) as usize;
-            if i + 22 + comment == buf.len() {
+            if i + EOCD_LEN + comment == buf.len() {
                 return Some(i);
             }
         }
@@ -378,6 +382,7 @@ impl SafetyReport {
 /// flags likely decompression bombs (uncompressed/compressed per entry).
 pub fn validate(inv: &ZipInventory, ratio_threshold: f64) -> SafetyReport {
     let mut r = SafetyReport::default();
+    let mut seen: BTreeMap<String, (String, bool)> = BTreeMap::new();
     for e in &inv.entries {
         if e.is_dir {
             r.dir_count += 1;
@@ -390,6 +395,20 @@ pub fn validate(inv: &ZipInventory, ratio_threshold: f64) -> SafetyReport {
         let name = &e.name;
         // Normalise separators for checks.
         let norm = name.replace('\\', "/");
+        let key = norm.trim_end_matches('/').to_lowercase();
+        if !key.is_empty() {
+            if let Some((previous, previous_is_dir)) = seen.insert(key, (name.clone(), e.is_dir)) {
+                if !(previous_is_dir && e.is_dir) {
+                    block(
+                        &mut r,
+                        name,
+                        &format!(
+                            "entry name collides with '{previous}' on a case-insensitive file system"
+                        ),
+                    );
+                }
+            }
+        }
 
         // Absolute path / drive letter / UNC.
         if norm.starts_with('/') {

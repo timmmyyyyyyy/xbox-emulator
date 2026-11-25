@@ -114,6 +114,9 @@ fn gfx7_equivalent(name: &str) -> Vec<String> {
         "buffer_wbinvl1" | "buffer_wbinvl1_vol" => return vec!["buffer_gl0_inv".into(), "buffer_gl1_inv".into()],
         "v_min_legacy_f32" => return vec!["v_cmp_lt_f32".into(), "v_cndmask_b32".into()],
         "v_max_legacy_f32" => return vec!["v_cmp_ge_f32".into(), "v_cndmask_b32".into()],
+        "v_rcp_clamp_f32" => return vec!["v_rcp_f32".into(), "v_cmp_eq_f32".into(), "v_cndmask_b32".into(), "v_cmp_eq_f32".into(), "v_cndmask_b32".into()],
+        "v_rsq_clamp_f32" => return vec!["v_rsq_f32".into(), "v_cmp_eq_f32".into(), "v_cndmask_b32".into(), "v_cmp_eq_f32".into(), "v_cndmask_b32".into()],
+        "v_log_clamp_f32" => return vec!["v_log_f32".into(), "v_cmp_eq_f32".into(), "v_cndmask_b32".into()],
         "v_cvt_pkaccum_u8_f32" => "v_cvt_pk_u8_f32",
         _ => name,
     };

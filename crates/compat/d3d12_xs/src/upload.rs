@@ -2110,7 +2110,13 @@ mod detile_speed_tests {
             per = per.min(t.elapsed().as_secs_f64() * 1000.0);
         }
         eprintln!("single-thread detile of 1 MB: best of 10 {per:.2} ms");
-        assert!(per < 20.0, "{per} ms");
+        for (i, &o) in offs.iter().enumerate() {
+            let (o, d) = (o as usize, (i / w) * pitch + (i % w) * bpe);
+            assert_eq!(&dst[d..d + bpe], &src[o..o + bpe], "element {i}");
+        }
+        if !cfg!(debug_assertions) {
+            assert!(per < 20.0, "{per} ms");
+        }
     }
 }
 

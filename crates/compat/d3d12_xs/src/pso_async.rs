@@ -123,6 +123,10 @@ pub fn real_of(placeholder: usize) -> usize {
     map().lock().ok().and_then(|m| m.get(&placeholder).map(|s| s.real.load(Ordering::Acquire))).unwrap_or(0)
 }
 
+pub fn is_compute_placeholder(p: usize) -> bool {
+    map().lock().ok().is_some_and(|m| m.get(&p).is_some_and(|s| s.kind == Kind::Compute))
+}
+
 pub fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {

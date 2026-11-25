@@ -109,7 +109,7 @@ fn fold(m: &str, a: u32, b: u32) -> Option<u32> {
 }
 
 fn wide(m: &str) -> bool {
-    m.ends_with("_b64") || m.ends_with("_u64") || m.ends_with("_i64")
+    (m.ends_with("_b64") || m.ends_with("_u64") || m.ends_with("_i64")) && !super::i32_result_of_64(m)
 }
 
 fn step(ins: &Insn, st: &mut St) {

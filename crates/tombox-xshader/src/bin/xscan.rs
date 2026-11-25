@@ -340,13 +340,47 @@ static USE_FXC: AtomicUsize = AtomicUsize::new(0);
 static MNEM: AtomicUsize = AtomicUsize::new(0);
 static MNEM_USE: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+static FSSM_ROOT: AtomicUsize = AtomicUsize::new(0);
+static FSSM_CHECK: AtomicUsize = AtomicUsize::new(0);
+static FSSM_TALLY: Mutex<BTreeMap<String, (usize, u64)>> = Mutex::new(BTreeMap::new());
+
+fn fssm_check(h: u64, st: &str, ex: &tombox_xshader::ShaderExtract, tr: &Result<hlsl::Translated, String>) {
+    let Some(rs) = ex.root_sig.as_ref() else { return };
+    let (class, detail) = match tombox_xshader::fssm_bind::parse(&ex.fssm) {
+        Err(e) => (format!("table unreadable: {}", normalise(&e)), e),
+        Ok(None) => ("no table".to_string(), String::new()),
+        Ok(Some(b)) => {
+            let d = b.disagreements(rs);
+            let mut bare = ex.clone();
+            bare.root_sig = None;
+            bare.has_root_sig = false;
+            let mine = hlsl::translate_with_fssm_root(&bare);
+            let tag = if d.is_empty() { "bindings agree" } else { "bindings DISAGREE" };
+            match (tr, mine) {
+                (Ok(a), Ok(b)) if a.hlsl == b.hlsl => (format!("{tag}, same HLSL"), d.join("; ")),
+                (Ok(_), Ok(_)) => (format!("{tag}, different HLSL"), d.join("; ")),
+                (Ok(_), Err(e)) => (format!("{tag}, table translation fails: {}", normalise(&e)), e),
+                (Err(_), Ok(_)) => (format!("{tag}, only the table translation succeeds"), d.join("; ")),
+                (Err(_), Err(_)) => (format!("{tag}, both fail"), d.join("; ")),
+            }
+        }
+    };
+    if !class.contains("agree, same HLSL") && !class.contains("both fail") {
+        eprintln!("FSSMCHK {h:016x} {st} {class} | {detail}");
+    }
+    FSSM_TALLY.lock().unwrap().entry(format!("{st} {class}")).or_insert((0, h)).0 += 1;
+}
+
 /// Translate (and optionally compile) one container. Returns (stage, result, compiled_now).
 fn process(blob: &[u8], compile: bool) -> (String, Result<(), String>, bool) {
     let r = std::panic::catch_unwind(|| match extract(blob) {
         Err(e) => (String::from("?"), Err(format!("extract: {e}")), false),
         Ok(ex) => {
             let st = stage_name(&ex.stage).to_string();
-            let tr = hlsl::translate(&ex);
+            let tr = if FSSM_ROOT.load(Ordering::Relaxed) != 0 { hlsl::translate_with_fssm_root(&ex) } else { hlsl::translate(&ex) };
+            if FSSM_CHECK.load(Ordering::Relaxed) != 0 {
+                fssm_check(fnv1a(blob), &st, &ex, &tr);
+            }
             if MNEM.load(Ordering::Relaxed) != 0 {
                 // Instruction usage: (shaders using it, of which translated).
                 let names: std::collections::BTreeSet<String> =
@@ -417,7 +451,7 @@ fn process(blob: &[u8], compile: bool) -> (String, Result<(), String>, bool) {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: {} <file> [--examples <dir>] [--limit <n>] [--jobs <n>] [--compile 1]", args[0]);
+        eprintln!("usage: {} <file> [--examples <dir>] [--limit <n>] [--jobs <n>] [--compile 1] [--fssm-root 1] [--fssm-check 1]", args[0]);
         return ExitCode::FAILURE;
     }
     let mut examples: Option<String> = None;
@@ -438,6 +472,8 @@ fn main() -> ExitCode {
             "--mnemonics" => MNEM.store((args[i + 1] == "1") as usize, Ordering::Relaxed),
             "--fxc-limit" => LIMIT.store(args[i + 1].parse().unwrap_or(120), Ordering::Relaxed),
             "--compiler" => USE_FXC.store((args[i + 1] == "fxc") as usize, Ordering::Relaxed),
+            "--fssm-root" => FSSM_ROOT.store((args[i + 1] == "1") as usize, Ordering::Relaxed),
+            "--fssm-check" => FSSM_CHECK.store((args[i + 1] == "1") as usize, Ordering::Relaxed),
             other => eprintln!("warning: ignoring {other}"),
         }
         i += 2;
@@ -591,6 +627,14 @@ fn main() -> ExitCode {
     for (reason, (count, ex)) in v.iter().take(80) {
         println!("{count:>7}  {reason}   [e.g. {ex:016x}]");
     }
+    let fssm = FSSM_TALLY.lock().unwrap();
+    if !fssm.is_empty() {
+        println!("--- FSSM binding table vs root signature (shaders with a root signature) ---");
+        for (k, (n, h)) in fssm.iter() {
+            println!("{n:>7}  {k}   [e.g. {h:016x}]");
+        }
+    }
+    drop(fssm);
     if MNEM.load(Ordering::Relaxed) != 0 {
         println!("--- mnemonics (shaders using, translated) ---");
         for (n, (used, ok)) in MNEM_USE.lock().unwrap().iter() {

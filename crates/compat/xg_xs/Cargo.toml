@@ -10,5 +10,8 @@ name = "xg_xs"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 
+[features]
+console-oracle = []
+
 [dependencies]
 compat-common = { path = "../compat-common" }

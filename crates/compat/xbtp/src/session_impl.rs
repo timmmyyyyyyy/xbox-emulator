@@ -65,6 +65,10 @@ pub unsafe fn wrap_session(session: SharedPtr<XbtpSession>, iid: *const GUID, ou
 }
 
 unsafe extern "system" fn si_qi(this: *mut SessionImpl, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = null_mut();
     if *iid == IID_XBTP_SESSION || *iid == IID_IUNKNOWN || *iid == IID_XBTP_CLIENT_SESSION {
         *out = this as *mut c_void;
         si_add_ref(this);
@@ -224,4 +228,53 @@ unsafe extern "system" fn si_get_property(this: *mut SessionImpl, name: *const u
 
 pub unsafe fn add_ref_raw(p: *mut c_void) -> u32 {
     com_add_ref(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_interface_clears_output_for_an_unsupported_iid() {
+        unsafe {
+            let session = new_session_impl(SharedPtr::default());
+            let v = &*(*session).vtbl;
+            let mut out = session as *mut c_void;
+            let hr = (v.query_interface)(session, &GUID::default(), &mut out);
+            let refs = (*session).refs.load(Ordering::Acquire);
+            assert_eq!((v.release)(session), 0);
+            assert_eq!(hr, E_NOINTERFACE);
+            assert!(out.is_null(), "unsupported QueryInterface retained the caller's pointer");
+            assert_eq!(refs, 1);
+        }
+    }
+
+    #[test]
+    fn query_interface_rejects_a_null_output_without_adding_a_reference() {
+        unsafe {
+            let session = new_session_impl(SharedPtr::default());
+            let v = &*(*session).vtbl;
+            for iid in [IID_IUNKNOWN, IID_XBTP_SESSION, IID_XBTP_CLIENT_SESSION, GUID::default()] {
+                assert_eq!((v.query_interface)(session, &iid, null_mut()), E_POINTER);
+                assert_eq!((*session).refs.load(Ordering::Acquire), 1);
+            }
+            assert_eq!((v.release)(session), 0);
+        }
+    }
+
+    #[test]
+    fn query_interface_preserves_identity_and_adds_one_reference_on_success() {
+        unsafe {
+            let session = new_session_impl(SharedPtr::default());
+            let v = &*(*session).vtbl;
+            for iid in [IID_IUNKNOWN, IID_XBTP_SESSION, IID_XBTP_CLIENT_SESSION] {
+                let mut out = null_mut();
+                assert_eq!((v.query_interface)(session, &iid, &mut out), S_OK);
+                assert_eq!(out, session as *mut c_void);
+                assert_eq!((*session).refs.load(Ordering::Acquire), 2);
+                assert_eq!((v.release)(out as *mut SessionImpl), 1);
+            }
+            assert_eq!((v.release)(session), 0);
+        }
+    }
 }

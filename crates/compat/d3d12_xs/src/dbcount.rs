@@ -623,8 +623,14 @@ pub fn note_stream_pso(pso: usize, stream: &[u8], shaders: &[Arc<Vec<u8>>]) {
     }
 }
 
-fn stream_rec(pso: usize) -> Option<Arc<StreamRec>> {
+pub(crate) fn stream_rec(pso: usize) -> Option<Arc<StreamRec>> {
     STREAMS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&pso).cloned()
+}
+
+impl StreamRec {
+    pub fn is_graphics(&self) -> bool {
+        self.subs.iter().any(|&(t, o)| matches!(t, SUB_VS | SUB_MS) && u64_at(&self.stream, o) != 0 && u64_at(&self.stream, o + 8) != 0)
+    }
 }
 
 #[derive(Clone)]
@@ -1123,6 +1129,7 @@ static VARIANTS: Mutex<Option<HashMap<(usize, usize, Pass, Option<VariantKey>), 
 struct Owned {
     _data: Vec<u8>,
     _ps: Option<Arc<Vec<u8>>>,
+    _gs: Option<Arc<Vec<u8>>>,
     _src: Src,
 }
 unsafe impl Send for Owned {}
@@ -1135,6 +1142,7 @@ unsafe fn create_variant(list: *mut c_void, src: &Src, pass: Pass, vk: Option<Va
         return Err("no device".into());
     }
     let mut out: *mut c_void = core::ptr::null_mut();
+    let mut gs = None;
     let (data, hr) = match src {
         Src::Desc { desc, .. } => {
             let mut d = desc.clone();
@@ -1153,23 +1161,47 @@ unsafe fn create_variant(list: *mut c_void, src: &Src, pass: Pass, vk: Option<Va
             (d, hr)
         }
         Src::Stream(r) => {
-            let s = variant_stream(&r.stream, &r.subs, pass, ps.as_ref().map(|c| c.as_slice()));
-            let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(dev, 0)) };
-            let mut d2: *mut c_void = core::ptr::null_mut();
-            if unsafe { qi(dev, &IID_DEVICE2, &mut d2) } < 0 || d2.is_null() {
-                return Err("no ID3D12Device2 for a pipeline stream".into());
-            }
-            let f: unsafe extern "system" fn(*mut c_void, *const [u64; 2], *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(d2, DEV2_CREATE_PIPELINE_STATE)) };
-            let desc = [s.len() as u64, s.as_ptr() as u64];
-            let hr = unsafe { f(d2, &desc, &IID_PSO, &mut out) };
-            unsafe { release(d2) };
+            let rect = if vk.is_some_and(|k| k.rect) { crate::rectlist::expand_stream(&r.stream, &r.subs) } else { None };
+            let s = match &rect {
+                Some((e, subs, _)) => variant_stream(e, subs, pass, ps.as_ref().map(|c| c.as_slice())),
+                None => variant_stream(&r.stream, &r.subs, pass, ps.as_ref().map(|c| c.as_slice())),
+            };
+            gs = rect.map(|v| v.2);
+            let hr = unsafe { create_stream_on(dev, &s, &mut out) }.map_err(|e| e.to_string())?;
             (s, hr)
         }
     };
     if hr < 0 || out.is_null() {
         return Err(format!("{pass:?} counting variant FAILED hr={hr:#010x}"));
     }
-    Ok((out as usize, Owned { _data: data, _ps: ps, _src: src.clone() }))
+    Ok((out as usize, Owned { _data: data, _ps: ps, _gs: gs, _src: src.clone() }))
+}
+
+unsafe fn create_stream_on(dev: *mut c_void, s: &[u8], out: &mut *mut c_void) -> Result<i32, &'static str> {
+    let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(dev, 0)) };
+    let mut d2: *mut c_void = core::ptr::null_mut();
+    if unsafe { qi(dev, &IID_DEVICE2, &mut d2) } < 0 || d2.is_null() {
+        return Err("no ID3D12Device2 for a pipeline stream");
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *const [u64; 2], *const Guid, *mut *mut c_void) -> i32 = unsafe { core::mem::transmute(vslot(d2, DEV2_CREATE_PIPELINE_STATE)) };
+    let desc = [s.len() as u64, s.as_ptr() as u64];
+    let hr = unsafe { f(d2, &desc, &IID_PSO, out) };
+    unsafe { release(d2) };
+    Ok(hr)
+}
+
+pub(crate) unsafe fn create_stream_pso(list: *mut c_void, s: &[u8]) -> Result<usize, String> {
+    let real = crate::cl2_state::real_device();
+    let dev = if real.is_null() { unsafe { device_of(list) } } else { real };
+    if dev.is_null() {
+        return Err("no device".into());
+    }
+    let mut out: *mut c_void = core::ptr::null_mut();
+    let hr = unsafe { create_stream_on(dev, s, &mut out) }?;
+    if hr < 0 || out.is_null() {
+        return Err(format!("hr={hr:#010x}"));
+    }
+    Ok(out as usize)
 }
 
 unsafe fn pass_pso(list: *mut c_void, pso: usize, src: &Src, pass: Pass, vk: Option<VariantKey>, ps: Option<Arc<Vec<u8>>>) -> usize {

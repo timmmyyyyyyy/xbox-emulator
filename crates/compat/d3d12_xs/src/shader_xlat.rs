@@ -290,6 +290,28 @@ fn log_pack_miss(hash: u64, rtfmt: &[u8; 8], linked: bool, src: &str, profile: &
     record("d3d12_xs", "shader_xlat", &format!("pack miss #{n} {id}: {verdict}; runtime {ours}; prelaunch {}", theirs.map(String::as_str).unwrap_or("<none>")));
 }
 
+fn first_gather_lod_note(hash: u64) -> bool {
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    SEEN.get_or_init(Default::default).lock().map(|mut s| s.insert(hash)).unwrap_or(false)
+}
+
+fn note_gather_lod_blind(hash: u64, offsets: &[u32]) {
+    if offsets.is_empty() || !first_gather_lod_note(hash) {
+        return;
+    }
+    record("d3d12_xs", "shader_xlat", &format!("GATHER4_L: hash={hash:016x} image_gather4_l at ISA {offsets:#x?} picks its footprint mip without the sampler LOD_BIAS/MIN_LOD/MAX_LOD: the S# is not visible to the translator"));
+}
+
+fn note_unknowns(hash: u64, unknowns: &[String]) {
+    static SEEN: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+    if unknowns.is_empty() || !SEEN.lock().map_or(false, |mut s| s.insert(hash)) {
+        return;
+    }
+    for u in unknowns {
+        record("d3d12_xs", "shader_xlat", &format!("UNKNOWN hash={hash:016x}: {u}"));
+    }
+}
+
 pub(crate) fn runtime_source(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &InputInterp, root: Option<&[u8]>, mode: &tombox_xshader::pack_key::Mode) -> Result<RtSrc, String> {
     let mut ex = tombox_xshader::extract(blob).map_err(|e| {
         dump_failure(hash, blob, None, &e);
@@ -302,6 +324,7 @@ pub(crate) fn runtime_source(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Inp
         dump_failure(hash, blob, None, &e);
         e
     })?;
+    note_unknowns(hash, &t.unknowns);
     if mode.cbv_raw.rewrites() {
         if let Some((slot, lim, _)) = crate::cbv_raw::clamp_knob().filter(|k| k.2.map_or(true, |h| h == hash)) {
             t.hlsl = crate::cbv_raw::clamp_reads(&t.hlsl, slot, lim);
@@ -316,6 +339,7 @@ pub(crate) fn runtime_source(blob: &[u8], hash: u64, rtfmt: &[u8; 8], link: &Inp
         crate::cbv_copy::note_shader_cb(hash, crate::cbv_copy::meta_of(&t));
     }
     crate::fmask_check::note_translation(hash, &t.hlsl, &t.fmask);
+    note_gather_lod_blind(hash, &t.gather_lod_blind);
     RUNTIME_SOURCES.with(|c| c.set(c.get() + 1));
     let needs = crate::mip_bind::Needs::of(&t);
     crate::mip_bind::note(hash, &needs);
@@ -1048,6 +1072,16 @@ pub fn counts() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gather_lod_blind_note_is_once_per_shader_hash() {
+        let h = 0x6a7e_4000_0000_0001u64;
+        assert!(first_gather_lod_note(h));
+        assert!(!first_gather_lod_note(h));
+        assert!(first_gather_lod_note(h + 1));
+        note_gather_lod_blind(h + 2, &[]);
+        assert!(first_gather_lod_note(h + 2));
+    }
 
     #[test]
     fn background_jobs_follow_title_memory_headroom() {

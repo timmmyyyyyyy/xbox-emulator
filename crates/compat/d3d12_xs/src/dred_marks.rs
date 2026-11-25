@@ -7,9 +7,12 @@ use compat_common::record;
 const XBOX_SLOT_RESET: usize = 10;
 const XBOX_SLOT_CLEAR_STATE: usize = 11;
 const XBOX_SLOT_SET_PSO: usize = 25;
+const XBOX_SLOT_DISPATCH: usize = 14;
 const PC_SET_MARKER: usize = 56;
 pub const PREFIX: &str = "tbpso ";
+pub const DIMS: &str = "tbdispatch ";
 const OP_SETMARKER: u32 = 0;
+const OP_DISPATCH: u32 = 6;
 const KEEP_RECORDINGS: usize = 6;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -23,6 +26,8 @@ pub struct Hashes {
 static PREV_SET: AtomicUsize = AtomicUsize::new(0);
 static PREV_RESET: AtomicUsize = AtomicUsize::new(0);
 static PREV_CLEAR: AtomicUsize = AtomicUsize::new(0);
+static PREV_DISPATCH: AtomicUsize = AtomicUsize::new(0);
+static PREV_DISPATCH_X: AtomicUsize = AtomicUsize::new(0);
 static MARKS: AtomicUsize = AtomicUsize::new(0);
 
 fn table() -> &'static Mutex<HashMap<usize, (Hashes, bool)>> {
@@ -177,7 +182,14 @@ pub unsafe fn mark(list: *mut c_void, pso: *mut c_void) {
         return;
     }
     let entry = table().lock().unwrap_or_else(|e| e.into_inner()).get(&(pso as usize)).copied();
-    let t = text(pso as usize, entry);
+    unsafe { write(list, text(pso as usize, entry)) };
+}
+
+pub fn dims_text(x: u32, y: u32, z: u32) -> String {
+    format!("{DIMS}{x}x{y}x{z}")
+}
+
+unsafe fn write(list: *mut c_void, t: String) {
     let w: Vec<u16> = t.encode_utf16().chain(Some(0)).collect();
     note_marker(list as usize, t);
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, u32) = unsafe { core::mem::transmute(crate::cmdlist_wrap::pc_method(list, PC_SET_MARKER)) };
@@ -189,6 +201,22 @@ unsafe extern "system" fn set_pso(list: *mut c_void, pso: *mut c_void) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void) = unsafe { core::mem::transmute(PREV_SET.load(Ordering::Relaxed)) };
     unsafe { f(list, pso) };
     unsafe { mark(list, pso) };
+}
+
+unsafe extern "system" fn dispatch(list: *mut c_void, x: u32, y: u32, z: u32) {
+    if !list.is_null() {
+        unsafe { write(list, dims_text(x, y, z)) };
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = unsafe { core::mem::transmute(PREV_DISPATCH.load(Ordering::Relaxed)) };
+    unsafe { f(list, x, y, z) };
+}
+
+unsafe extern "system" fn dispatch_x(list: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
+    if !list.is_null() {
+        unsafe { write(list, dims_text(x, y, z)) };
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) = unsafe { core::mem::transmute(PREV_DISPATCH_X.load(Ordering::Relaxed)) };
+    unsafe { f(list, x, y, z, flags) };
 }
 
 unsafe extern "system" fn reset(list: *mut c_void, alloc: *mut c_void, pso: *mut c_void) -> i32 {
@@ -222,7 +250,14 @@ pub fn install(vt: &[AtomicUsize]) {
     vt[XBOX_SLOT_SET_PSO].store(set_pso as usize, Ordering::Relaxed);
     vt[XBOX_SLOT_RESET].store(reset as usize, Ordering::Relaxed);
     vt[XBOX_SLOT_CLEAR_STATE].store(clear_state as usize, Ordering::Relaxed);
-    record("d3d12_xs", "dred", "TOMBOX_DRED=2: every SetPipelineState/Reset/ClearState also writes a SetMarker naming the bound PSO's Xbox shader hashes; a removal report names the shaders of the unfinished draws");
+    for (slot, prev, hook) in [(XBOX_SLOT_DISPATCH, &PREV_DISPATCH, dispatch as usize), (crate::console_slots::CL_DISPATCH_X, &PREV_DISPATCH_X, dispatch_x as usize)] {
+        let cur = vt[slot].load(Ordering::Relaxed);
+        if cur != 0 {
+            prev.store(cur, Ordering::Relaxed);
+            vt[slot].store(hook, Ordering::Relaxed);
+        }
+    }
+    record("d3d12_xs", "dred", "TOMBOX_DRED=2: every SetPipelineState/Reset/ClearState also writes a SetMarker naming the bound PSO's Xbox shader hashes and every Dispatch/DispatchX one with its group counts; a removal report names the shaders and dispatch sizes of the unfinished work");
 }
 
 pub fn marks() -> usize {
@@ -234,7 +269,15 @@ pub fn is_work(op: u32) -> bool {
 }
 
 pub fn governing<'a>(ctx: &'a [(u32, String)], i: u32, ours: bool) -> Option<&'a str> {
-    ctx.iter().filter(|(k, s)| *k <= i && s.starts_with(PREFIX) == ours).max_by_key(|(k, _)| *k).map(|(_, s)| s.as_str())
+    ctx.iter().filter(|(k, s)| *k <= i && !s.starts_with(DIMS) && s.starts_with(PREFIX) == ours).max_by_key(|(k, _)| *k).map(|(_, s)| s.as_str())
+}
+
+pub fn dispatch_dims<'a>(hist: &[u32], ctx: &'a [(u32, String)], i: u32) -> Option<&'a str> {
+    let (k, s) = ctx.iter().filter(|(k, s)| *k < i && s.starts_with(DIMS)).max_by_key(|(k, _)| *k)?;
+    if (k + 1..i).any(|j| hist.get(j as usize).is_some_and(|&op| is_work(op))) {
+        return None;
+    }
+    Some(&s[DIMS.len()..])
 }
 
 pub fn from_side_table(hist: &[u32], recorded: &[String]) -> Vec<(u32, String)> {
@@ -258,7 +301,8 @@ pub fn window_lines(hist: &[u32], last: u32, ctx: &[(u32, String)]) -> Vec<Strin
         let p = governing(ctx, i, true);
         let ev = governing(ctx, i, false).map(|e| format!(" (title marker {e:?})")).unwrap_or_default();
         let tag = if i == last { " FIRST UNFINISHED" } else if i < last { " done" } else { " queued" };
-        out.push(format!("op #{i} {}{tag}: {}{ev}", crate::dred::op_name(op), p.unwrap_or("no PSO marker before this op")));
+        let groups = dispatch_dims(hist, ctx, i).filter(|_| op == OP_DISPATCH).map(|d| format!(" groups={d}")).unwrap_or_default();
+        out.push(format!("op #{i} {}{tag}: {}{groups}{ev}", crate::dred::op_name(op), p.unwrap_or("no PSO marker before this op")));
         if let Some(p) = p {
             if !psos.contains(&p) {
                 psos.push(p);
@@ -293,6 +337,25 @@ mod tests {
         assert!(out[4].starts_with("op #11 DISPATCH queued"));
         assert_eq!(out.last().unwrap(), "3 distinct PSO(s) in ops 4..16; 3 PSO marker(s) in this list");
         assert_eq!(window_lines(&[4, 4], 0, &[])[0], "op #0 DRAWINDEXEDINSTANCED FIRST UNFINISHED: no PSO marker before this op");
+    }
+
+    #[test]
+    fn dispatch_markers_give_the_group_counts_of_the_dispatch_they_precede() {
+        let hist = vec![0u32, 0, 6, 0, 46, 6, 0, 6, 6, 0, 3];
+        let ctx = vec![
+            (0u32, format!("{PREFIX}0x40 cs=0123456789abcdef")),
+            (1, dims_text(4096, 1, 1)),
+            (3, dims_text(7, 2, 3)),
+            (6, dims_text(1, 1, 1)),
+            (9, dims_text(9, 9, 9)),
+        ];
+        let out = window_lines(&hist, 5, &ctx);
+        assert_eq!(out[0], format!("op #2 DISPATCH done: {PREFIX}0x40 cs=0123456789abcdef groups=4096x1x1"));
+        assert_eq!(out[1], format!("op #5 DISPATCH FIRST UNFINISHED: {PREFIX}0x40 cs=0123456789abcdef groups=7x2x3"));
+        assert_eq!(out[2], format!("op #7 DISPATCH queued: {PREFIX}0x40 cs=0123456789abcdef groups=1x1x1"));
+        assert_eq!(out[3], format!("op #8 DISPATCH queued: {PREFIX}0x40 cs=0123456789abcdef"));
+        assert!(out[4].starts_with("op #10 DRAWINSTANCED queued") && !out[4].contains("groups=") && !out[4].contains("title marker"), "{}", out[4]);
+        assert_eq!(dims_text(65535, 2, 1), "tbdispatch 65535x2x1");
     }
 
     #[test]

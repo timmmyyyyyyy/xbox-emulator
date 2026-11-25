@@ -1,6 +1,6 @@
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::collections::{BTreeMap, HashMap};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 
 pub const SYNTHETIC_TEXTURE_BASE: u64 = 0xf5a7_0000_0000_0000;
@@ -20,6 +20,8 @@ struct Tables {
     texture_va: HashMap<usize, u64>,
     state: HashMap<usize, u32>,
     width: HashMap<usize, u64>,
+    owned: HashMap<usize, HashSet<(bool, u64)>>,
+    watched: HashSet<usize>,
 }
 
 static T: Mutex<Option<Tables>> = Mutex::new(None);
@@ -27,8 +29,88 @@ static NEXT_SYNTH: AtomicU64 = AtomicU64::new(SYNTHETIC_TEXTURE_BASE);
 
 fn with<R>(f: impl FnOnce(&mut Tables) -> R) -> R {
     let mut g = T.lock().unwrap_or_else(|e| e.into_inner());
-    let t = g.get_or_insert_with(|| Tables { ranges: Vec::new(), cpu: Vec::new(), texture_va: HashMap::new(), state: HashMap::new(), width: HashMap::new() });
+    let t = g.get_or_insert_with(|| Tables { ranges: Vec::new(), cpu: Vec::new(), texture_va: HashMap::new(), state: HashMap::new(), width: HashMap::new(), owned: HashMap::new(), watched: HashSet::new() });
     f(t)
+}
+
+pub fn forget(res: usize) {
+    with(|t| {
+        for (cpu, start) in t.owned.remove(&res).unwrap_or_default() {
+            let levels = if cpu { &mut t.cpu } else { &mut t.ranges };
+            for m in levels.iter_mut() {
+                if m.get(&start).is_some_and(|e| e.res == res) {
+                    m.remove(&start);
+                }
+            }
+        }
+        t.texture_va.remove(&res);
+        t.state.remove(&res);
+        t.width.remove(&res);
+        t.watched.remove(&res);
+    });
+}
+
+const GUID_TB_GPU_VA_WATCH: crate::device_wrap::Guid = crate::device_wrap::Guid { d1: 0x5c3e_91a7, d2: 0x6b0d, d3: 0x4f2a, d4: [0x8e, 0x47, 0x1d, 0x93, 0xc2, 0x5a, 0x70, 0xe4] };
+const IID_IUNKNOWN: crate::device_wrap::Guid = crate::device_wrap::Guid { d1: 0, d2: 0, d3: 0, d4: [0xc0, 0, 0, 0, 0, 0, 0, 0x46] };
+const OBJECT_SET_PRIVATE_DATA_INTERFACE: usize = 5;
+
+#[repr(C)]
+struct Watch {
+    vt: &'static WatchVt,
+    refs: AtomicU32,
+    armed: AtomicBool,
+    res: usize,
+}
+
+#[repr(C)]
+struct WatchVt {
+    qi: unsafe extern "system" fn(*mut Watch, *const crate::device_wrap::Guid, *mut *mut c_void) -> i32,
+    add: unsafe extern "system" fn(*mut Watch) -> u32,
+    rel: unsafe extern "system" fn(*mut Watch) -> u32,
+}
+
+static WATCH_VT: WatchVt = WatchVt { qi: watch_qi, add: watch_add, rel: watch_rel };
+
+unsafe extern "system" fn watch_qi(this: *mut Watch, riid: *const crate::device_wrap::Guid, ppv: *mut *mut c_void) -> i32 {
+    if ppv.is_null() {
+        return 0x8000_4003u32 as i32;
+    }
+    if !riid.is_null() && unsafe { *riid == IID_IUNKNOWN } {
+        unsafe { watch_add(this) };
+        unsafe { *ppv = this as *mut c_void };
+        return 0;
+    }
+    unsafe { *ppv = core::ptr::null_mut() };
+    0x8000_4002u32 as i32
+}
+
+unsafe extern "system" fn watch_add(this: *mut Watch) -> u32 {
+    unsafe { (*this).refs.fetch_add(1, Ordering::AcqRel) + 1 }
+}
+
+unsafe extern "system" fn watch_rel(this: *mut Watch) -> u32 {
+    let n = unsafe { (*this).refs.fetch_sub(1, Ordering::AcqRel) - 1 };
+    if n == 0 {
+        let w = unsafe { Box::from_raw(this) };
+        if w.armed.load(Ordering::Acquire) {
+            forget(w.res);
+        }
+    }
+    n
+}
+
+unsafe fn watch(res: *mut c_void) {
+    if !with(|t| t.watched.insert(res as usize)) {
+        return;
+    }
+    let w = Box::into_raw(Box::new(Watch { vt: &WATCH_VT, refs: AtomicU32::new(1), armed: AtomicBool::new(false), res: res as usize }));
+    let set: unsafe extern "system" fn(*mut c_void, *const crate::device_wrap::Guid, *mut c_void) -> i32 = unsafe { core::mem::transmute(*(*(res as *const *const usize)).add(OBJECT_SET_PRIVATE_DATA_INTERFACE)) };
+    unsafe { (*w).armed.store(true, Ordering::Release) };
+    if unsafe { set(res, &GUID_TB_GPU_VA_WATCH, w as *mut c_void) } < 0 {
+        unsafe { (*w).armed.store(false, Ordering::Release) };
+        with(|t| t.watched.remove(&(res as usize)));
+    }
+    unsafe { watch_rel(w) };
 }
 
 const MAX_LEVELS: usize = 8;
@@ -71,13 +153,19 @@ fn find_in(levels: &[BTreeMap<u64, Entry>], a: u64) -> Option<(Entry, u64)> {
 
 pub fn insert(e: Entry) {
     if e.len != 0 {
-        with(|t| insert_into(&mut t.ranges, e));
+        with(|t| {
+            insert_into(&mut t.ranges, e);
+            t.owned.entry(e.res).or_default().insert((false, e.start));
+        });
     }
 }
 
 pub fn insert_cpu(e: Entry) {
     if e.len != 0 {
-        with(|t| insert_into(&mut t.cpu, e));
+        with(|t| {
+            insert_into(&mut t.cpu, e);
+            t.owned.entry(e.res).or_default().insert((true, e.start));
+        });
     }
 }
 
@@ -339,6 +427,7 @@ pub unsafe fn note_resource(real_device: *mut c_void, res: *mut c_void, desc: &[
     if res.is_null() || desc.len() < 0x38 {
         return;
     }
+    unsafe { watch(res) };
     set_state(res as usize, init_state);
     let buffer = u32::from_le_bytes(desc[0..4].try_into().unwrap()) == 1;
     let rvt = unsafe { *(res as *const *const usize) };
@@ -482,5 +571,66 @@ mod tests {
         set_state(0xabc, 0x4);
         note_barriers(2, b.as_ptr());
         assert_eq!(state(0xabc), 0x400);
+    }
+
+    #[test]
+    fn forget_drops_only_the_ranges_of_that_resource() {
+        let base = 0x6_1000_0000u64;
+        insert(Entry { start: base, len: 0x1000, res: 0x51, buffer: true });
+        insert(Entry { start: base + 0x10_0000, len: 0x1000, res: 0x51, buffer: true });
+        insert_cpu(Entry { start: base + 0x20_0000, len: 0x100, res: 0x51, buffer: true });
+        insert(Entry { start: base + 0x2000, len: 0x1000, res: 0x52, buffer: true });
+        insert(Entry { start: base + 0x30_0000, len: 0x1_0000, res: 0x53, buffer: true });
+        insert(Entry { start: base + 0x30_0000, len: 0x100, res: 0x51, buffer: true });
+        assert_eq!(lookup(base + 0x30_0008).map(|(e, _)| e.res), Some(0x51));
+        set_state(0x51, 4);
+        forget(0x51);
+        assert_eq!(lookup(base + 8), None);
+        assert_eq!(lookup(base + 0x10_0008), None);
+        assert_eq!(lookup(base + 0x20_0008), None);
+        assert_eq!(lookup(base + 0x2008).map(|(e, _)| e.res), Some(0x52));
+        assert_eq!(lookup(base + 0x30_0008).map(|(e, o)| (e.res, o)), Some((0x53, 8)));
+        assert_eq!(state(0x51), 0);
+        forget(0x51);
+        assert_eq!(lookup(base + 0x2008).map(|(e, _)| e.res), Some(0x52));
+    }
+
+    #[test]
+    fn a_destroyed_buffer_leaves_the_tables_and_a_second_note_keeps_the_watch() {
+        use crate::device_wrap::Guid;
+        const IID_DEVICE: Guid = Guid { d1: 0x1898_19f1, d2: 0x1db6, d3: 0x4b57, d4: [0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7] };
+        const IID_RESOURCE: Guid = Guid { d1: 0x6964_42be, d2: 0xa72e, d3: 0x4059, d4: [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad] };
+        unsafe {
+            let slot = |o: *mut c_void, i: usize| *(*(o as *const *const usize)).add(i);
+            let p = crate::host_proc(b"D3D12CreateDevice\0");
+            assert!(p != 0);
+            let mk: extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(p);
+            let mut dev: *mut c_void = core::ptr::null_mut();
+            assert!(mk(core::ptr::null_mut(), 0xb000, &IID_DEVICE, &mut dev) >= 0 && !dev.is_null());
+            let mut d = [0u8; 0x38];
+            d[0..4].copy_from_slice(&1u32.to_le_bytes());
+            d[0x10..0x18].copy_from_slice(&0x1_0000u64.to_le_bytes());
+            d[0x18..0x1c].copy_from_slice(&1u32.to_le_bytes());
+            d[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
+            d[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
+            d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            d[0x2c..0x30].copy_from_slice(&1u32.to_le_bytes());
+            let props: [u32; 5] = [1, 0, 0, 1, 1];
+            let create: unsafe extern "system" fn(*mut c_void, *const u32, u32, *const u8, u32, *const u8, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(slot(dev, 27));
+            let mut res: *mut c_void = core::ptr::null_mut();
+            let hr = create(dev, props.as_ptr(), 0, d.as_ptr(), 0, core::ptr::null(), &IID_RESOURCE, &mut res);
+            assert!(hr >= 0 && !res.is_null(), "CreateCommittedResource hr={hr:#010x}");
+            let placed = 0x6_9000_0000u64;
+            note_resource(dev, res, &d, 0x40, Some(placed));
+            note_resource(dev, res, &d, 0x40, Some(placed));
+            assert_eq!(lookup(placed + 4).map(|(e, o)| (e.res, o)), Some((res as usize, 4)));
+            assert_eq!(state(res as usize), 0x40);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(slot(res, 2));
+            assert_eq!(release(res), 0);
+            assert_eq!(lookup(placed + 4), None);
+            assert_eq!(state(res as usize), 0);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(slot(dev, 2));
+            release(dev);
+        }
     }
 }

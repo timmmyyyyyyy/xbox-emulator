@@ -325,6 +325,8 @@ fn ds_gds_append_consume() {
         }
     }
     if hw {
+        let verified_names: std::collections::BTreeSet<&str> = ok.iter().map(String::as_str).collect();
+        verified("gds_append_consume", &verified_names, &Default::default());
         println!("ds_gds_append_consume: {} mnemonics verified on hardware: {ok:?}", ok.len());
     } else {
         println!("ds_gds_append_consume: WARP waves are narrower than an RDNA2 wave32, so only the counter totals were checked. Set TOMBOX_EXEC_HW=1 to check the per-wave return values on a wave32 device.");
@@ -432,5 +434,14 @@ fn ds_gws_counter_boundaries_across_rows_and_partial_waves() {
         let (_, actual) = exec_gds_dispatch(&prog(0, &setup, &[]), &expected, 32, 1).unwrap();
         expected[idx] = 2 * (value & 4095);
         assert_eq!(actual, expected, "initialization and bulk post with {value:#x}");
+    }
+}
+
+#[test]
+fn ds_append_and_consume_on_lds_are_refused_by_name() {
+    for (op, name) in [(0x3eu32, "ds_append"), (0x3d, "ds_consume")] {
+        let words = prog(m0(0x200, SIZE), &ds(op, 0x20, 0, 0, 0, 10), &[10]);
+        let e = translate(&cs_extract(&words, T)).err().unwrap_or_else(|| panic!("{name} on LDS translated"));
+        assert!(e.contains(name), "{name}: the refusal should name the instruction: {e}");
     }
 }

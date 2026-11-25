@@ -150,6 +150,10 @@ pub fn serialized<R>(f: impl FnOnce() -> R) -> R {
     with(|_| f())
 }
 
+pub fn virtual_alloc2_self(base: usize, size: usize, kind: u32, protect: u32) -> usize {
+    unsafe { VirtualAlloc2(GetCurrentProcess(), base as *mut c_void, size, kind, protect, core::ptr::null_mut(), 0) as usize }
+}
+
 pub fn live_bytes() -> u64 {
     with(|s| s.pfns.len() as u64 * PAGE as u64)
 }

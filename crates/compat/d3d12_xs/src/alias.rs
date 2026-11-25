@@ -950,9 +950,17 @@ mod tests {
             let mb = create_placed_x(g.dev, p as u64, &d, 0x1_0000, 0, core::ptr::null(), &mut b).expect("private placement aliased");
             assert_eq!(mb.kind, Kind::Title);
             assert_eq!(VirtualFree(p, 0, 0x8000), 0, "the PC runtime pins private memory under an open heap");
+            let heap = mb.heap as *mut c_void;
+            vcall!(heap, 1, fn() -> u32);
             vcall!(b, 2, fn() -> u32);
             flush();
-            assert_eq!(VirtualFree(p, 0, 0x8000), 1, "once the last placed resource is released its title heap must be gone");
+            assert_eq!(spans_starting_at(p as u64), 0, "the flush must drop the title span once its last placed resource is released");
+            assert_eq!(vcall!(heap, 2, fn() -> u32), 0, "after the flush nothing but the test may still reference the title heap");
+            let t = std::time::Instant::now();
+            while VirtualFree(p, 0, 0x8000) == 0 {
+                assert!(t.elapsed() < std::time::Duration::from_secs(10), "the OS still pins the memory 10 s after its title heap was destroyed");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
     }
 
@@ -1010,8 +1018,9 @@ mod tests {
             let r = VirtualAlloc(core::ptr::null_mut(), 0x400_0000, 0x2000, 0x01) as u64;
             assert!(r != 0);
             let small = tex_desc(256, 256, 28, 0x1);
+            let small_size = allocation_info(dev, &small).0.max(0x4_0000);
             let mut first: *mut c_void = core::ptr::null_mut();
-            let m0 = create_placed_x(dev, r, &small, 0x4_0000, 0x4, core::ptr::null(), &mut first).expect("first placement opens the reservation-wide span");
+            let m0 = create_placed_x(dev, r, &small, small_size, 0x4, core::ptr::null(), &mut first).expect("first placement opens the reservation-wide span");
             assert_eq!(m0.kind, Kind::Local);
             let mut depth = tex_desc(1920, 1080, 19, 0x2);
             depth[0x24..0x28].copy_from_slice(&2u32.to_le_bytes());
@@ -1029,11 +1038,11 @@ mod tests {
             assert_ne!(md.heap, m0.heap, "the oversize depth must not sit in the shared reservation heap");
             let next_va = dva + round_up(console, PLACEMENT_ALIGN);
             let mut n: *mut c_void = core::ptr::null_mut();
-            let mn = create_placed_x(dev, next_va, &small, 0x4_0000, 0x4, core::ptr::null(), &mut n).expect("next title placement");
+            let mn = create_placed_x(dev, next_va, &small, small_size, 0x4, core::ptr::null(), &mut n).expect("next title placement");
             assert!(mn.heap != md.heap || mn.offset >= md.offset + pc.0, "next placement {:#x}+{:#x} overlaps the depth's PC tail", mn.heap, mn.offset);
             assert_eq!((mn.heap, mn.offset), (m0.heap, next_va - r));
             let mut a: *mut c_void = core::ptr::null_mut();
-            let ma = create_placed_x(dev, dva, &small, 0x4_0000, 0x4, core::ptr::null(), &mut a).expect("alias inside the console extent");
+            let ma = create_placed_x(dev, dva, &small, small_size, 0x4, core::ptr::null(), &mut a).expect("alias inside the console extent");
             assert_eq!((ma.heap, ma.offset), (md.heap, 0), "title aliases inside the console extent share the depth's memory");
             for x in [first, d, n, a] {
                 vcall!(x, 2, fn() -> u32);

@@ -161,3 +161,45 @@ fn legacy_free_page_query_writes_two_triples_through_the_dll_export() {
         }
     }
 }
+
+#[test]
+fn query_19041_handles_free_noaccess_and_writable_regions() {
+    if std::env::var_os("XMEM_QUERY_CHILD").is_none() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "query_19041_handles_free_noaccess_and_writable_regions"])
+            .env("XMEM_QUERY_CHILD", "1")
+            .env("TOMBOX_CONSOLE_OSBUILD", "19041")
+            .status().unwrap();
+        assert!(result.success());
+        return;
+    }
+    extern "system" {
+        fn VirtualAlloc(base: usize, size: usize, kind: u32, protect: u32) -> usize;
+        fn VirtualFree(base: usize, size: usize, kind: u32) -> i32;
+    }
+    unsafe {
+        let query: unsafe extern "system" fn(*mut c_void, usize, *mut u64) -> i32 =
+            core::mem::transmute(export(xmem(), c"XMemVirtualQuery"));
+        let proc = GetCurrentProcess();
+        let mut out = [u64::MAX; 9];
+        assert_eq!(query(proc, 0, out.as_mut_ptr()), 1);
+        assert_eq!(out[1], 0);
+        assert!(out[3] > 0);
+        assert_eq!(out[4] as u32, 0x10000);
+        assert_eq!(out[4] >> 32, 1);
+        assert_eq!(out[7], 0);
+        assert_eq!(out[8], u64::MAX);
+        for protect in [1, 4] {
+            let base = VirtualAlloc(0, 0x10000, 0x3000, protect);
+            assert_ne!(base, 0);
+            let result = query(proc, base + 17, out.as_mut_ptr());
+            assert_ne!(VirtualFree(base, 0, 0x8000), 0);
+            assert_eq!(result, 1);
+            assert_eq!(out[1] as usize, base);
+            assert_eq!(out[3], 0x10000);
+            assert_eq!(out[4] as u32, 0x1000);
+            assert_eq!(out[4] >> 32, protect as u64);
+            assert_eq!(out[8], u64::MAX);
+        }
+    }
+}

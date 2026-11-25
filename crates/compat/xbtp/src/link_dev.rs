@@ -23,7 +23,66 @@ struct Pending {
     ov: usize,
 }
 
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryObject(handle: HANDLE, class: u32, info: *mut c_void, size: u32, returned: *mut u32) -> i32;
+    fn NtSetIoCompletion(port: HANDLE, key: usize, overlapped: usize, status: i32, bytes: usize) -> i32;
+    fn RtlNtStatusToDosError(status: i32) -> u32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn DuplicateHandle(from: HANDLE, handle: HANDLE, to: HANDLE, duplicate: *mut HANDLE, access: u32, inherit: i32, options: u32) -> i32;
+}
+
+struct CompletionPort {
+    handle: usize,
+    key: usize,
+}
+
+impl Drop for CompletionPort {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.handle as HANDLE) };
+    }
+}
+
+pub(crate) unsafe fn set_completion_port(device: HANDLE, port: HANDLE, key: usize) -> HRESULT {
+    let mut r = router();
+    let Some(ep) = r.eps.iter_mut().find(|ep| ep.id == device as usize) else {
+        return hr_from_win32(ERROR_INVALID_HANDLE);
+    };
+    if ep.completion.is_some() || port.is_null() {
+        return E_INVALIDARG;
+    }
+    let process = GetCurrentProcess();
+    let mut duplicate = core::ptr::null_mut();
+    if DuplicateHandle(process, port, process, &mut duplicate, 0, 0, 2) == 0 {
+        return hr_last_error();
+    }
+    let owned = CompletionPort { handle: duplicate as usize, key };
+    let mut basic = [0u32; 14];
+    let status = NtQueryObject(duplicate, 0, basic.as_mut_ptr().cast(), core::mem::size_of_val(&basic) as u32, core::ptr::null_mut());
+    if status < 0 {
+        return hr_from_win32(RtlNtStatusToDosError(status));
+    }
+    let mut object_type = [0usize; 64];
+    let status = NtQueryObject(duplicate, 2, object_type.as_mut_ptr().cast(), core::mem::size_of_val(&object_type) as u32, core::ptr::null_mut());
+    if status < 0 {
+        return hr_from_win32(RtlNtStatusToDosError(status));
+    }
+    let name = core::slice::from_raw_parts(object_type[1] as *const u16, (object_type[0] as u16 / 2) as usize);
+    if !name.iter().copied().eq("IoCompletion".encode_utf16()) {
+        return hr_from_win32(ERROR_INVALID_HANDLE);
+    }
+    if basic[1] & 2 == 0 {
+        return hr_from_win32(5);
+    }
+    ep.completion = Some(owned);
+    S_OK
+}
+
 struct Endpoint {
+    completion: Option<CompletionPort>,
     id: usize,
     port: Option<u32>,
     inbox: VecDeque<u8>,
@@ -59,13 +118,18 @@ pub fn pending_recvs(port: u32) -> usize {
     router().eps.iter().filter(|e| e.port == Some(port)).map(|e| e.pending.len()).sum()
 }
 
-unsafe fn complete(p: Pending, n: u32, status: usize) {
-    let ov = p.ov as *mut OVERLAPPED;
+unsafe fn complete(port: Option<&CompletionPort>, ov: *mut OVERLAPPED, n: u32, status: usize) {
+    let event = (*ov).event as usize;
     (*ov).internal_high = n as usize;
     (*ov).internal = status;
-    let ev = ((*ov).event as usize & !1) as HANDLE;
+    let ev = (event & !1) as HANDLE;
     if !ev.is_null() {
         SetEvent(ev);
+    }
+    if event & 1 == 0 {
+        if let Some(port) = port {
+            NtSetIoCompletion(port.handle as HANDLE, port.key, ov as usize, status as i32, n as usize);
+        }
     }
 }
 
@@ -84,7 +148,7 @@ unsafe fn pump(ep: &mut Endpoint) {
     while !ep.inbox.is_empty() || ep.eof {
         let Some(p) = ep.pending.pop_front() else { break };
         let n = take(ep, p.buf as *mut u8, p.len, p.peek);
-        complete(p, n, 0);
+        complete(ep.completion.as_ref(), p.ov as *mut OVERLAPPED, n, 0);
         if n == 0 {
             continue;
         }
@@ -116,21 +180,16 @@ unsafe fn dev_open() -> HANDLE {
     let mut r = router();
     let id = TAG | r.next_id;
     r.next_id += 1;
-    r.eps.push(Endpoint { id, port: None, inbox: VecDeque::new(), eof: false, pending: VecDeque::new() });
+    r.eps.push(Endpoint { id, completion: None, port: None, inbox: VecDeque::new(), eof: false, pending: VecDeque::new() });
     id as HANDLE
 }
 
-unsafe fn sync_done(r: *mut u32, ov: *mut OVERLAPPED, n: u32) -> i32 {
+unsafe fn sync_done(ep: &Endpoint, r: *mut u32, ov: *mut OVERLAPPED, n: u32) -> i32 {
     if !r.is_null() {
         *r = n;
     }
     if !ov.is_null() {
-        (*ov).internal = 0;
-        (*ov).internal_high = n as usize;
-        let ev = ((*ov).event as usize & !1) as HANDLE;
-        if !ev.is_null() {
-            SetEvent(ev);
-        }
+        complete(ep.completion.as_ref(), ov, n, 0);
     }
     1
 }
@@ -145,7 +204,7 @@ unsafe fn recv(r: &mut Router, me: usize, i: *const c_void, il: u32, o: *mut c_v
     let ep = &mut r.eps[me];
     if !ep.inbox.is_empty() || ep.eof {
         let n = take(ep, wb.buf, wb.len, peek);
-        return sync_done(ret, ov, n);
+        return sync_done(ep, ret, ov, n);
     }
     if ov.is_null() {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -230,7 +289,7 @@ unsafe fn send(r: &mut Router, me: usize, i: *const c_void, il: u32, o: *mut c_v
             return 0;
         }
     }
-    sync_done(ret, ov, (MSG_SIZE + payload.len()) as u32)
+    sync_done(&r.eps[me], ret, ov, (MSG_SIZE + payload.len()) as u32)
 }
 
 unsafe fn dev_ioctl(h: HANDLE, code: u32, i: *const c_void, il: u32, o: *mut c_void, ol: u32, ret: *mut u32, ov: *mut OVERLAPPED) -> i32 {
@@ -261,7 +320,7 @@ unsafe fn cancel_where(h: HANDLE, pick: impl Fn(&Pending) -> bool) -> i32 {
     let all: Vec<Pending> = ep.pending.drain(..).collect();
     for p in all {
         if pick(&p) {
-            complete(p, 0, STATUS_CANCELLED);
+            complete(ep.completion.as_ref(), p.ov as *mut OVERLAPPED, 0, STATUS_CANCELLED);
         } else {
             ep.pending.push_back(p);
         }
@@ -294,7 +353,7 @@ unsafe fn dev_close(h: HANDLE) -> i32 {
     };
     let mut ep = r.eps.remove(k);
     for p in ep.pending.drain(..) {
-        complete(p, 0, STATUS_CANCELLED);
+        complete(ep.completion.as_ref(), p.ov as *mut OVERLAPPED, 0, STATUS_CANCELLED);
     }
     1
 }

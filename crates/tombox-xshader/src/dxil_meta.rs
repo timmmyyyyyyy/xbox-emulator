@@ -164,7 +164,7 @@ mod tests {
     fn invalid_dimensions_do_not_fall_back_or_overflow() {
         let mut m = mi(13, 16);
         m.num_threads = [0, 2, 1];
-        let mut gs = Some(GsInfo { input_primitive: 0, output_topology: 0, max_vertex_count: 0, mesh: Some(m) });
+        let mut gs = Some(GsInfo { input_primitive: 0, output_topology: 0, max_vertex_count: 0, mesh: Some(m), tess: None });
         assert!(fill_num_threads(&mut gs, || panic!("consulted")).is_err());
         m.num_threads = [0; 3];
         let mut p = parse_entry_stage_props(MS).unwrap();
@@ -176,9 +176,9 @@ mod tests {
     fn psv0_size_wins_and_disassembly_is_not_consulted() {
         let mut m = mi(13, 16);
         m.num_threads = [128, 1, 1];
-        let mut gs = Some(GsInfo { input_primitive: 0, output_topology: 0, max_vertex_count: 0, mesh: Some(m) });
+        let mut gs = Some(GsInfo { input_primitive: 0, output_topology: 0, max_vertex_count: 0, mesh: Some(m), tess: None });
         assert_eq!(fill_num_threads(&mut gs, || panic!("consulted")), Ok(false));
-        let mut none = Some(GsInfo { input_primitive: 0, output_topology: 0, max_vertex_count: 0, mesh: Some(mi(13, 16)) });
+        let mut none = Some(GsInfo { input_primitive: 0, output_topology: 0, max_vertex_count: 0, mesh: Some(mi(13, 16)), tess: None });
         assert_eq!(fill_num_threads(&mut none, || None), Ok(false));
         assert_eq!(fill_num_threads(&mut none, || Some("garbage".into())), Ok(false));
         assert_eq!(fill_num_threads(&mut none, || Some(MS.into())), Ok(true));

@@ -38,7 +38,7 @@ pub fn shift() -> u32 {
     if s != 0 {
         return s;
     }
-    let want = shift_for(compat_common::gameinput_ext::default_os_build(), LARGE_GRANULE.load(Ordering::Acquire) != 0);
+    let want = shift_for(compat_common::os_host::routes::current_build(), LARGE_GRANULE.load(Ordering::Acquire) != 0);
     match SHIFT.compare_exchange(0, want, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => want,
         Err(v) => v,

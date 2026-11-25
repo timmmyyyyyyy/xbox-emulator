@@ -160,6 +160,10 @@ pub fn pso_stage_codes(pso: usize) -> Vec<(&'static str, usize)> {
     ["vs", "ps", "ds", "hs", "gs"].iter().zip(ps::GFX_STAGES.iter()).map(|(n, &o)| (*n, rd64(&desc, o) as usize)).filter(|e| e.1 != 0).collect()
 }
 
+pub fn is_compute(pso: usize) -> bool {
+    compute_registry().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&pso)
+}
+
 pub fn compute_desc(pso: usize) -> Option<Vec<u8>> {
     compute_registry().lock().unwrap().get(&pso).map(|r| r.desc.clone())
 }

@@ -2,13 +2,17 @@ use super::{r, Emitter};
 use crate::rdna2::{Insn, Opnd};
 
 pub(super) fn is_wide_lds(m: &str) -> bool {
-    matches!(m, "ds_write_b64" | "ds_write2_b64" | "ds_write2st64_b64" | "ds_read_b64" | "ds_read2_b64" | "ds_read2st64_b64")
+    matches!(
+        m,
+        "ds_write_b64" | "ds_write2_b64" | "ds_write2st64_b64" | "ds_read_b64" | "ds_read2_b64" | "ds_read2st64_b64" | "ds_write_b96" | "ds_write_b128" | "ds_read_b96"
+            | "ds_read_b128"
+    )
 }
 
 fn vg(o: &Opnd, k: u8) -> Result<Opnd, String> {
     match o {
         Opnd::Vgpr(n) => Ok(Opnd::Vgpr(n + k)),
-        _ => Err("64-bit LDS access with a non-VGPR operand".into()),
+        _ => Err("wide LDS access with a non-VGPR operand".into()),
     }
 }
 
@@ -29,6 +33,8 @@ pub(super) fn split_wide_lds(ins: &Insn) -> Result<Vec<Insn>, String> {
     let scale = if m.contains("st64") { 512 } else { 8 };
     let bytes: Vec<u32> = match m {
         "ds_write_b64" | "ds_read_b64" => vec![off, off + 4],
+        "ds_write_b96" | "ds_read_b96" => vec![off, off + 4, off + 8],
+        "ds_write_b128" | "ds_read_b128" => vec![off, off + 4, off + 8, off + 12],
         _ => vec![o0 * scale, o0 * scale + 4, o1 * scale, o1 * scale + 4],
     };
     if bytes.iter().any(|&b| b > 0xffff) {
@@ -38,6 +44,7 @@ pub(super) fn split_wide_lds(ins: &Insn) -> Result<Vec<Insn>, String> {
     if m.starts_with("ds_write") {
         let data: Vec<Opnd> = match m {
             "ds_write_b64" => vec![ins.src[1], vg(&ins.src[1], 1)?],
+            "ds_write_b96" | "ds_write_b128" => (0..bytes.len() as u8).map(|k| vg(&ins.src[1], k)).collect::<Result<_, _>>()?,
             _ => vec![ins.src[1], vg(&ins.src[1], 1)?, ins.src[2], vg(&ins.src[2], 1)?],
         };
         return Ok(bytes.iter().zip(data).map(|(&b, d)| part(ins, "ds_write_b32", 0x0d, b, vec![addr, d, Opnd::Vgpr(0)], vec![Opnd::Vgpr(0)])).collect());
@@ -106,7 +113,8 @@ impl Emitter<'_> {
             self.touch(o);
         }
         let addr = r(&ins.src[0])?;
-        let at = |o: u32| format!("tb_lds[(({addr} + {:#x}u) >> 2) & 8191u]", o * step);
+        let wrap = self.lds_wrap();
+        let at = |o: u32| format!("tb_lds[(({addr} + {:#x}u) >> 2) {wrap}]", o * step);
         let (x0, x1) = (r(&ins.src[1])?, r(&ins.src[2])?);
         let t = self.tmp;
         self.tmp += 1;

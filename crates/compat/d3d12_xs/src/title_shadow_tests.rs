@@ -350,7 +350,9 @@ fn buffer_then_texture_migrates_to_one_local_heap_and_keeps_bytes() {
         *g.mapped(up).add(5) = 0x5555_0005;
         g.run(|l| copy(l, p, 20, up, 20, 4), || {});
         *cpu.add(7) = 0x7777_0007;
-        let mq = create_placed_x(g.dev, va, &t, 0x4_0000, 4, core::ptr::null(), &mut q).expect("texture after");
+        let mut tinfo = [0u64; 2];
+        vcall!(g.dev, 25, fn(*mut u64, u32, u32, *const u8) -> *mut u64, tinfo.as_mut_ptr(), 0, 1, t.as_ptr());
+        let mq = create_placed_x(g.dev, va, &t, tinfo[0].max(0x4_0000), 4, core::ptr::null(), &mut q).expect("texture after");
         assert_eq!(mq.kind, Kind::Local);
         assert_eq!(mq.offset, mp.offset, "the texture lands at the buffer's offset in the migrated reservation");
         assert!(!shadows(|m| m.contains_key(&mp.heap)), "the shadow is retired by the migration");

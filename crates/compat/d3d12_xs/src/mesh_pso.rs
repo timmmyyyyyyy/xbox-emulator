@@ -455,6 +455,8 @@ fn stream_summary(stream: &[u8]) -> String {
     }
 }
 
+const XBOX_TOPOLOGY_TYPE_RECT: u32 = 0x13;
+
 pub fn translate_stream(stream: &[u8], xlat: &dyn Fn(u32, &[u8], (u32, [u32; 8]), Option<&[u8]>) -> Result<Arc<Vec<u8>>, String>) -> Result<(Vec<u8>, Vec<Arc<Vec<u8>>>), String> {
     let subs = parse(stream)?;
     validate(stream, &subs)?;
@@ -485,6 +487,17 @@ pub fn translate_stream(stream: &[u8], xlat: &dyn Fn(u32, &[u8], (u32, [u32; 8])
         }
         let base = out.len();
         out.extend_from_slice(&stream[start..end]);
+        if !has_ms && ty == SUB_PRIMITIVE_TOPOLOGY && out.len() >= base + (inner - start) + 4 {
+            let dst = base + (inner - start);
+            let val = u32::from_le_bytes(out[dst..dst + 4].try_into().unwrap());
+            if val == XBOX_TOPOLOGY_TYPE_RECT {
+                out[dst..dst + 4].copy_from_slice(&3u32.to_le_bytes());
+                static LOGGED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+                if LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+                    record("d3d12_xs", "CreatePipelineState", &format!("Xbox rect-list primitive topology type {val:#x} mapped to TRIANGLE (3) for PC PSO stream"));
+                }
+            }
+        }
         if !matches!(ty, 1..=6 | SUB_AS | SUB_MS) {
             continue;
         }
@@ -845,6 +858,15 @@ mod tests {
         assert_eq!(subs_vs, vec![(SUB_VS, 8), (SUB_PRIMITIVE_TOPOLOGY, 28), (SUB_PS, 40)]);
         assert_eq!(u32::from_le_bytes(out_vs[28..32].try_into().unwrap()), 3);
         assert_eq!(keep_vs.len(), 2);
+
+        for (xbox, pc) in [(0x13u32, 3u32), (0x20, 0x20), (2, 2), (4, 4)] {
+            let mut s = Vec::new();
+            push(&mut s, SUB_VS, &bc(&ms_in));
+            push(&mut s, SUB_PRIMITIVE_TOPOLOGY, &xbox.to_le_bytes());
+            push(&mut s, SUB_PS, &bc(&ps));
+            let (out, _) = translate_stream(&s, &xl_raw).unwrap();
+            assert_eq!(u32::from_le_bytes(out[28..32].try_into().unwrap()), pc, "Xbox topology {xbox:#x}");
+        }
     }
 
     fn rec(ty: u32, size: usize, payload_at: usize, payload: &[u8]) -> Vec<u8> {

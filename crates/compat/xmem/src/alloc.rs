@@ -334,7 +334,7 @@ pub unsafe extern "system" fn XMemGetAllocationStatistics(memory_type: u32, alt:
             o.allocation_count = if alt != 0 { 0 } else { s.count.load(Ordering::Relaxed) as u32 };
             o.released_pages = crate::pool::released(i);
         }
-        None if compat_common::gameinput_ext::default_os_build() == 19041 => {
+        None if compat_common::os_host::routes::current_build() == 19041 => {
             SetLastError(ERROR_INVALID_PARAMETER);
             return 0;
         }
@@ -489,14 +489,18 @@ mod tests {
 
     #[test]
     fn allocation_statistics_rejects_invalid_memory_types_on_19041() {
-        if std::env::var("TOMBOX_GI_OSBUILD").as_deref() != Ok("19041") {
+        if std::env::var_os("XMEM_BUILD_TEST_CHILD").is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "alloc::tests::allocation_statistics_rejects_invalid_memory_types_on_19041"])
-                .env("TOMBOX_GI_OSBUILD", "19041")
+                .env("XMEM_BUILD_TEST_CHILD", "1")
+                .env("TOMBOX_CONSOLE_OSBUILD", "19041")
+                .env("TOMBOX_GI_OSBUILD", "22000")
                 .status().unwrap();
             assert!(status.success());
             return;
         }
+        assert_eq!(XMemSetAllocationHysteresis(11, 0, 1), 1);
+        assert_eq!(XMemGetAllocationHysteresis(11, 0), 4 << 20);
         for (memory_type, alt, size, expected_error) in [
             (16, 0, 32, ERROR_INVALID_PARAMETER),
             (u32::MAX, 1, 32, ERROR_INVALID_PARAMETER),

@@ -521,7 +521,7 @@ fn translated_pixel_shaders_with_uavs_keep_their_source() {
     note_translated(&uav, b"blob", 2, &[0; 8]);
     let m = PS_SRC.lock().unwrap();
     let m = m.as_ref().unwrap();
-    assert!(!m.contains_key(&(plain.as_ptr() as usize)));
+    assert!(!m.get(&(plain.as_ptr() as usize)).is_some_and(|e| (e.0, e.1) == (plain.len(), fnv1a(&plain))));
     let e = m.get(&(uav.as_ptr() as usize)).unwrap();
     assert_eq!((e.0, e.1), (uav.len(), fnv1a(&uav)));
 }

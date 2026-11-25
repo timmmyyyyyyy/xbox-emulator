@@ -342,7 +342,7 @@ fn fdiv_pre(xv: f64, yv: f64) -> Prog {
     d64v(&mut p, 2, xv);
     d64v(&mut p, 4, yv);
     d64v(&mut p, 18, 1.0);
-    p.raw(&v3b(0x16e, 6, 124, [v(4), v(4), v(2)], 0));
+    p.raw(&v3b(0x16e, 6, 125, [v(4), v(4), v(2)], 0));
     p.raw(&[vop1(0x2f, 8, v(6))]);
     p.raw(&v3d(0x14c, 10, [v(6), v(8), v(18)], 1));
     p.raw(&v3d(0x14c, 12, [v(8), v(10), v(8)], 0));
@@ -533,7 +533,7 @@ fn div_scale_and_fixup_f64() {
         d64v(&mut pre, 4, d);
         let mut post = pr();
         post.raw(&[vop1(1, 0, v(10)), vop1(1, 1, v(11))]);
-        let w = v3b(0x16e, 10, 124, [v(2), v(4), v(2)], 5);
+        let w = v3b(0x16e, 10, 125, [v(2), v(4), v(2)], 5);
         if !r.is_nan() {
             c.add("v_div_scale_f64", &pre, &w, &post, &dw(r));
         }
@@ -561,9 +561,259 @@ fn div_scale_and_fixup_f64() {
     c.run_both("div_scale_fixup");
 }
 
+fn expf32(x: f32) -> i32 {
+    ((x.to_bits() >> 23) & 0xff) as i32
+}
+
+fn sub32(x: f32) -> bool {
+    x != 0.0 && x.abs() < f32::from_bits(0x0080_0000)
+}
+
+fn ldexp32(x: f32, e: i32) -> f32 {
+    (x as f64 * 2f64.powi(e)) as f32
+}
+
+fn f32_bits(e: u32, m: u32, neg: bool) -> f32 {
+    f32::from_bits(((neg as u32) << 31) | (e << 23) | (m & 0x7f_ffff))
+}
+
+fn fma32_exact(a: f32, b: f32, c: f32) -> f32 {
+    let p = (a as f64) * (b as f64);
+    let s = p + (c as f64);
+    if s.is_nan() {
+        return f32::from_bits(0x7fc0_0000);
+    }
+    if s.is_infinite() {
+        return s as f32;
+    }
+    let bb = s - p;
+    let e = (p - (s - bb)) + ((c as f64) - bb);
+    let bits = s.to_bits();
+    let lo = bits as u32;
+    let hi = (bits >> 32) as u32;
+    let adj = ((e != 0.0) && (lo & 1 == 0)) as u32;
+    let dn = adj & (((e > 0.0) != (s > 0.0)) as u32);
+    let new_lo = lo.wrapping_add(adj).wrapping_sub(2 * dn);
+    let new_hi = hi.wrapping_sub(dn & ((lo == 0) as u32));
+    f64::from_bits(((new_hi as u64) << 32) | (new_lo as u64)) as f32
+}
+
+fn div_scale32_ref(x: f32, d: f32, n: f32) -> (f32, u32) {
+    if d == 0.0 || n == 0.0 {
+        return (f32::from_bits(0x7fc0_0000), 1);
+    }
+    let (en, ed) = (expf32(n), expf32(d));
+    if en - ed >= 96 {
+        return (if x == d { ldexp32(x, 64) } else { x }, 1);
+    }
+    if sub32(d) {
+        return (ldexp32(x, 64), 0);
+    }
+    let tr = (1.0f64 / (d as f64)).abs() < 2f64.powi(-126);
+    let tq = ((n as f64) / (d as f64)).abs() < 2f64.powi(-126);
+    if tr && tq {
+        return (if x == d { ldexp32(x, -64) } else { x }, 1);
+    }
+    if tr {
+        return (ldexp32(x, -64), 0);
+    }
+    if tq {
+        return (if x == n { ldexp32(x, 64) } else { x }, 1);
+    }
+    if en <= 23 {
+        return (ldexp32(x, 64), 0);
+    }
+    (x, 0)
+}
+
+fn div_fmas32_ref(a: f32, b: f32, c: f32, vcc: u32) -> Option<u32> {
+    let r = fma32_exact(a, b, c);
+    if r.is_nan() {
+        return Some(0x7fc0_0000);
+    }
+    if vcc & 1 == 0 {
+        return Some(r.to_bits());
+    }
+    if expf32(c) > 127 {
+        if sub32(r) {
+            return None;
+        }
+        let s = (r as f64) * 2f64.powi(64);
+        return Some(if s.is_infinite() { f32::INFINITY.to_bits() } else { (s as f32).to_bits() });
+    }
+    let q = (r as f64) * 2f64.powi(-64);
+    if q != 0.0 && q.abs() < 2f64.powi(-126) {
+        return None;
+    }
+    Some((q as f32).to_bits())
+}
+
+fn fmas32_case(c: &mut Cases, a: f32, b: f32, cc: f32, vcc: u32, want: u32) {
+    let mut pre = pr();
+    pre.vv(2, fb(a)).vv(4, fb(b)).vv(6, fb(cc));
+    pre.sv(106, vcc);
+    let mut post = pr();
+    post.raw(&[vop1(1, 0, v(10))]);
+    c.add("v_div_fmas_f32", &pre, &vop3(0x16f, 10, [v(2), v(4), v(6)]), &post, &[want]);
+}
+
+#[test]
+fn div_fmas_f32_direct() {
+    let mut c = Cases::new();
+    fmas32_case(&mut c, 3.0, 5.0, 4.0, 0, fb(19.0));
+    fmas32_case(&mut c, 3.0, 5.0, 4.0, 1, fb(19.0 * 2f32.powi(64)));
+    fmas32_case(&mut c, 3.0, 5.0, 1.0, 1, fb(16.0 * 2f32.powi(-64)));
+    fmas32_case(&mut c, -1.0, 2.0 + 2f32.powi(-22), 2.0, 1, fb(-2f32.powi(42)));
+    fmas32_case(&mut c, f32::MAX, 1.0, 2.0, 1, f32::INFINITY.to_bits());
+    fmas32_case(&mut c, 0.0, f32::INFINITY, 1.0, 1, 0x7fc0_0000);
+    fmas32_case(&mut c, 0.0, 0.0, -0.0, 1, 0);
+    fmas32_case(&mut c, -0.0, 1.0, -0.0, 1, 1 << 31);
+    let mut seed = 0xf3a5_0000_1234_9876u64;
+    let mut n = 0;
+    while n < 60 {
+        let r = xs(&mut seed);
+        let r2 = xs(&mut seed);
+        let r3 = xs(&mut seed);
+        let (ea, eb, ec) = match n % 3 {
+            0 => (120 + r2 % 40, 120 + (r2 >> 16) % 40, 120 + (r2 >> 32) % 40),
+            1 => (127 + r2 % 2, 127 + (r2 >> 16) % 2, 128 + (r2 >> 32) % 2),
+            _ => (60 + r2 % 100, 60 + (r2 >> 16) % 100, 60 + (r2 >> 32) % 100),
+        };
+        let a = f32_bits(ea as u32, r as u32, r3 & 1 != 0);
+        let b = f32_bits(eb as u32, (r >> 7) as u32, r3 & 2 != 0);
+        let cc = f32_bits(ec as u32, (r3 >> 3) as u32, r3 & 4 != 0);
+        let vcc = (r3 >> 5) as u32 & 1;
+        if let Some(w) = div_fmas32_ref(a, b, cc, vcc) {
+            fmas32_case(&mut c, a, b, cc, vcc, w);
+            n += 1;
+        }
+    }
+    c.run_both("div_fmas_f32_direct");
+}
+
+#[test]
+fn div_scale_and_fixup_f32() {
+    let mut c = Cases::new();
+    let rows: Vec<(f32, f32)> = vec![
+        (6.0, 2.0),
+        (1.0, 3.0),
+        (1e30, 1e-30),
+        (1.0, 1e-30),
+        (1.0, 1.5 * 2f32.powi(126)),
+        (1e-30, 1e10),
+        (2f32.powi(-100), 1.0),
+        (0.0, 1.0),
+        (1.0, 0.0),
+        (f32::NAN, 1.0),
+        (f32::INFINITY, 1.0),
+    ];
+    for &(n, d) in &rows {
+        for x in [d, n] {
+            let (r, vcc) = div_scale32_ref(x, d, n);
+            let mut pre = pr();
+            pre.vv(2, fb(x)).vv(4, fb(d)).vv(6, fb(n));
+            pre.sv(106, 0x55);
+            let mut post = pr();
+            post.raw(&[vop1(1, 0, v(10))]).s2v(1, 106);
+            c.add("v_div_scale_f32", &pre, &vop3b(0x16d, 10, VCC, [v(2), v(4), v(6)]), &post, &[fb(r), vcc]);
+        }
+        let (r, _) = div_scale32_ref(-n, d, -n);
+        let mut pre = pr();
+        pre.vv(2, fb(n)).vv(4, fb(d));
+        let mut post = pr();
+        post.raw(&[vop1(1, 0, v(10))]);
+        let w = v3b(0x16d, 10, 124, [v(2), v(4), v(2)], 5);
+        if !r.is_nan() {
+            c.add("v_div_scale_f32", &pre, &w, &post, &[fb(r)]);
+        }
+    }
+    let fix: Vec<(u32, f32, f32, u32)> = vec![
+        (fb(2.5), 2.0, 5.0, fb(2.5)),
+        (fb(2.5), -2.0, 5.0, fb(-2.5)),
+        (fb(7.0), 0.0, 1.0, f32::INFINITY.to_bits()),
+        (fb(7.0), 0.0, -1.0, f32::NEG_INFINITY.to_bits()),
+        (fb(7.0), f32::INFINITY, 1.0, 0),
+        (fb(7.0), 1.0, f32::INFINITY, f32::INFINITY.to_bits()),
+        (fb(7.0), 0.0, 0.0, 0x7fc0_0000),
+        (fb(7.0), f32::INFINITY, f32::NEG_INFINITY, 0x7fc0_0000),
+        (fb(7.0), 1.0, f32::from_bits(0x7f80_0001), 0x7fc0_0001),
+        (fb(7.0), f32::from_bits(0xff80_0002), 1.0, 0xffc0_0002),
+        (fb(7.0), 1e30, 1e-30, 0),
+        (fb(7.0), -1e30, 1e-30, 0x8000_0000),
+        (0x7fc0_0000, 3.0, 1.0, f32::INFINITY.to_bits()),
+        (0x7fc0_0000, -3.0, 1.0, f32::NEG_INFINITY.to_bits()),
+        (fb(-0.25), -2.0, -0.5, fb(0.25)),
+    ];
+    for &(q, d, n, want) in &fix {
+        vc(&mut c, "v_div_fixup_f32", &[(2, q), (4, fb(d)), (6, fb(n))], &vop3(0x15f, 10, [v(2), v(4), v(6)]), &[10], &[want]);
+    }
+    c.run_both("div_scale_fixup_f32");
+}
+
+fn fdiv32_pre(xv: f32, yv: f32) -> Prog {
+    let mut p = pr();
+    p.vv(2, fb(xv));
+    p.vv(4, fb(yv));
+    p.vv(18, fb(1.0));
+    p.raw(&v3b(0x16d, 6, 124, [v(4), v(4), v(2)], 0));
+    p.raw(&[vop1(0x2a, 8, v(6))]);
+    p.raw(&v3d(0x14b, 10, [v(6), v(8), v(18)], 1));
+    p.raw(&v3d(0x14b, 12, [v(8), v(10), v(8)], 0));
+    p.raw(&v3d(0x14b, 10, [v(6), v(12), v(18)], 1));
+    p.raw(&v3b(0x16d, 14, VCC, [v(2), v(4), v(2)], 0));
+    p.raw(&v3d(0x14b, 12, [v(12), v(10), v(12)], 0));
+    p.raw(&[vop2(0x08, 16, v(14), 12)]);
+    p.raw(&v3d(0x14b, 10, [v(6), v(16), v(14)], 1));
+    p
+}
+
+fn fdiv32_case(c: &mut Cases, xv: f32, yv: f32) {
+    let pre = fdiv32_pre(xv, yv);
+    let mut op = Vec::new();
+    op.extend_from_slice(&v3d(0x16f, 10, [v(10), v(12), v(16)], 0));
+    op.extend_from_slice(&v3d(0x15f, 10, [v(10), v(4), v(2)], 0));
+    let mut post = pr();
+    post.raw(&[vop1(1, 0, v(10))]);
+    let q = (xv as f64) / (yv as f64);
+    let want = if q.is_nan() { 0x7fc0_0000 } else { (q as f32).to_bits() };
+    c.add("v_div_fmas_f32", &pre, &op, &post, &[want]);
+}
+
+#[test]
+fn div_f32_sequence() {
+    let mut c = Cases::new();
+    let pairs: Vec<(f32, f32)> = vec![
+        (1.0, 3.0),
+        (2.0, 7.0),
+        (-5.5, 0.1),
+        (1e20, 1e-10),
+        (1e-10, 1e10),
+        (3.0, 1.5),
+        (123.456, 0.789),
+        (1000.0, 3.0),
+        (0.001, 1000.0),
+        (1.0, 1.0),
+        (0.0, 1.0),
+        (1.0, 0.0),
+        (0.0, 0.0),
+        (f32::INFINITY, 2.0),
+        (2.0, f32::INFINITY),
+        (f32::INFINITY, f32::NEG_INFINITY),
+    ];
+    for &(xv, yv) in &pairs {
+        fdiv32_case(&mut c, xv, yv);
+        fdiv32_case(&mut c, -xv, yv);
+    }
+    c.run_both("div_f32");
+}
+
+mod amd_fold;
 mod basic;
 mod fract;
+mod interp;
 mod lanes;
 mod leonida;
+mod mbcnt;
 mod rdna2_silicon;
+mod scratch;
 mod vopc;

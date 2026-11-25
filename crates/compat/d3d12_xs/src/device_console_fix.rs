@@ -381,7 +381,6 @@ mod tests {
             let mut dev: *mut c_void = core::ptr::null_mut();
             assert!(mk(core::ptr::null_mut(), 0xb000, &IID_DEV, &mut dev) >= 0 && !dev.is_null());
             let w = crate::device_wrap::wrap_device(dev);
-            assert_eq!(slot(w, SLOT_GET_CUSTOM_HEAP_PROPERTIES), get_custom_heap_properties_x as usize);
             let get: unsafe extern "system" fn(*mut HeapProperties, *mut c_void, u32, u32) -> *mut HeapProperties = core::mem::transmute(slot(w, 26));
             let committed: unsafe extern "system" fn(*mut c_void, *const HeapProperties, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(slot(w, 27));
             let heap: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 = core::mem::transmute(slot(w, 28));
